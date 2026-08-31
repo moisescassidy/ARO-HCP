@@ -644,3 +644,9 @@ cleanup: $(TEMPLATIZE)
 image-updater:
 	@$(MAKE) -C tooling/image-updater update
 .PHONY: image-updater
+
+# Documentation tests
+test-docs:
+	@echo "Running documentation tests..."
+	@./test/docs/personal-dev-readme-test.sh
+.PHONY: test-docs
