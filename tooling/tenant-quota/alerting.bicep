@@ -26,8 +26,11 @@ var prowE2EParallelMinSuccessfulRuns = 20
 var prowE2EParallelP95MaxSeconds = 9000 // 2h30m
 var prowCollectionMaxAgeSeconds = 900 // 15 minutes
 var prowBatchMaxConsecutiveFailures = 4
-var prowInvalidJobsMaxPercentage = 0.10
+var prowInvalidJobsMaxRate = '0.10'
 
+// The lookback must match prow.retention (tooling/tenant-quota/deploy/values.yaml), since
+// prow_ci_cached_runs only counts runs still inside that retention window.
+var prowInvalidJobs24h = 'sum(increase(prow_ci_invalid_jobs_total[24h]))'
 var prowHighFrequencyRuns = 'sum by (job_name, job_type) (prow_ci_job_info{job_type=~"presubmit|batch"})'
 var prowHighFrequencyFailures = 'sum by (job_name, job_type) (prow_ci_job_info{job_type=~"presubmit|batch",result=~"failure|error"})'
 var prowScheduledRuns = 'sum by (job_name, job_type) (prow_ci_job_info{job_type=~"periodic|postsubmit"})'
@@ -523,15 +526,15 @@ resource prowCIAlerts 'Microsoft.AlertsManagement/prometheusRuleGroups@2023-03-0
       {
         alert: 'ProwCIInvalidJobsDetected'
         enabled: true
-        expression: 'sum(increase(prow_ci_invalid_jobs_total[24h])) / (sum(prow_ci_cached_runs) + sum(increase(prow_ci_invalid_jobs_total[24h]))) > ${prowInvalidJobsMaxPercentage}'
-        for: 'PT1M'
+        expression: '${prowInvalidJobs24h} / (sum(prow_ci_cached_runs) + ${prowInvalidJobs24h}) > ${prowInvalidJobsMaxRate}'
+        for: 'PT30M'
         severity: 3
         labels: {
           severity: 'warning'
         }
         annotations: {
           summary: 'High rate of malformed completed Prow CI jobs detected'
-          description: 'Malformed completed Prow jobs exceeded ${prowInvalidJobsMaxPercentage * 100}% of all completed jobs in the last 24h.'
+          description: 'Malformed completed Prow jobs were {{ $value | humanizePercentage }} of all completed jobs over the last 24h (threshold 10%). Break the total down with sum by (reason) (increase(prow_ci_invalid_jobs_total[24h])).'
           runbook_url: 'https://github.com/Azure/ARO-HCP/blob/main/docs/ci/dev-ci-monitoring.md#exporter-health-checks'
         }
         actions: [

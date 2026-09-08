@@ -95,6 +95,10 @@ verify-kql:
 	hack/kql-verify.sh
 .PHONY: verify-kql
 
+verify-bicep:
+	hack/verify-bicep.sh
+.PHONY: verify-bicep
+
 update: deepcopy json-format
 .PHONY: update
 

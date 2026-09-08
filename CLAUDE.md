@@ -16,6 +16,7 @@ make lint-fix          # Run lint with --fix
 make fmt               # Run goimports across all modules
 make verify            # Run all verification checks (deepcopy, json-format, yamlfmt, materialize, gomega, schema) — this is what CI runs
 make verify-kql        # Validate KQL (Kusto Query Language) files
+make verify-bicep      # Lint every *.bicep file in the repo (requires the az CLI)
 make generate          # Regenerate deepcopy, mocks, format, tidy
 make generate-kiota    # Regenerate the ARM SDK (under test/sdk/), then run licenses + fmt
 make tidy              # Run go mod tidy across all modules + go work sync
