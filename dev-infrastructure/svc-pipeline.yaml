@@ -480,6 +480,19 @@ resourceGroups:
       - "AnmPreconditionFailedException"
       - "MaxRetryCountReached"
       - "ServiceUnavailable"
+      # aks-cluster-base.bicep enables azureMonitorProfile.metrics, so every
+      # managed-cluster write makes AKS reconcile the managed-Prometheus core
+      # extension. Any concurrent operation (node-image auto-upgrade, nodepool
+      # op, our own upgrade-aks-cluster step) makes that write return a
+      # 409-class conflict and fails the whole ARM deployment. Microsoft
+      # documents this as wait-and-retry, not a bad chart (AROSLSRE-1864).
+      # Matched on the message rather than the CreateOrUpdateExtensionFailed
+      # inner-error code, which also covers non-transient extension failures
+      # such as a policy denial (AROSLSRE-1632) where retrying cannot help.
+      # NOTE: no-op in stg and int until AROSLSRE-1778/1779 land — those stages
+      # set useExclusiveLocks in stages.yaml and sdp-pipelines' generator
+      # discards automatedRetry entirely whenever the stage fails fast.
+      - "conflicting operation in progress"
       maximumRetryCount: 3
       durationBetweenRetries: 2m
   - name: upgrade-aks-cluster

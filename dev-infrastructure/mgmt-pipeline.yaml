@@ -425,6 +425,11 @@ resourceGroups:
       - "Resource is in Updating state"
       - "There was a problem communicating with the identity service"
       - "DeploymentScriptExceededMaxAllowedTime"
+      # Same AKS core-extension conflict as the svc cluster step — mgmt clusters
+      # share aks-cluster-base.bicep and so reconcile the managed-Prometheus
+      # extension on every managed-cluster write. See svc-pipeline.yaml for the
+      # full rationale and the stg/int caveat (AROSLSRE-1864).
+      - "conflicting operation in progress"
       maximumRetryCount: 3
       durationBetweenRetries: 2m
   - name: svc-mgmt-aks-permissions
