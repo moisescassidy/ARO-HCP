@@ -9,6 +9,7 @@ use (
 	./dev-infrastructure/scripts/postgres-access
 	./fleet
 	./frontend
+	./hack/verify-automated-retry
 	./hack/verify-gomega-assertions
 	./hack/verify-mi-containers
 	./hack/verify-schema-additional-properties

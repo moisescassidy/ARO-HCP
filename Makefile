@@ -98,7 +98,7 @@ verify-kql:
 update: deepcopy json-format
 .PHONY: update
 
-verify: verify-deepcopy verify-json-format verify-generate verify-yamlfmt verify-materialize verify-gomega-assertions verify-mi-containers verify-schema
+verify: verify-deepcopy verify-json-format verify-generate verify-yamlfmt verify-materialize verify-gomega-assertions verify-mi-containers verify-schema verify-automated-retry
 .PHONY: verify
 
 verify-schema:
@@ -112,6 +112,10 @@ verify-gomega-assertions:
 verify-mi-containers:
 	go run ./hack/verify-mi-containers ./test/e2e/
 .PHONY: verify-mi-containers
+
+verify-automated-retry:
+	go run ./hack/verify-automated-retry .
+.PHONY: verify-automated-retry
 
 verify-yamlfmt: yamlfmt
 	./hack/verify.sh yamlfmt

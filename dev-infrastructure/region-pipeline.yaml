@@ -114,7 +114,6 @@ resourceGroups:
       errorContainsAny:
       - "InternalServerError"
       - "Internal server error"
-      - "500 Internal Server Error"
       maximumRetryCount: 3
       durationBetweenRetries: 1m
     variables:
@@ -136,7 +135,6 @@ resourceGroups:
       errorContainsAny:
       - "InternalServerError"
       - "Internal server error"
-      - "500 Internal Server Error"
       maximumRetryCount: 3
       durationBetweenRetries: 1m
     variables:
@@ -192,7 +190,6 @@ resourceGroups:
       - "Internal error"
       - "InternalServerError"
       - "Internal server error"
-      - "500 Internal Server Error"
       maximumRetryCount: 4
       durationBetweenRetries: 2m
     variables:
