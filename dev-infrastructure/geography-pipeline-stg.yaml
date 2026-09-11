@@ -60,6 +60,9 @@ resourceGroups:
     template: templates/kusto.bicep
     parameters: configurations/kusto-stg.tmpl.bicepparam
     deploymentLevel: ResourceGroup
+    dependsOn:
+    - resourceGroup: global
+      step: output
     automatedRetry:
       errorContainsAny:
       - "InternalServerError"
@@ -69,7 +72,9 @@ resourceGroups:
   - name: kusto-lookup
     action: ARM
     template: templates/kusto-lookup.bicep
-    parameters: configurations/kusto-lookup.tmpl.bicepparam
+    # Must source the cluster name from stgGlobalV2 (like the deploy step above),
+    # otherwise the lookup targets the live V1 cluster and fails with ResourceNotFound.
+    parameters: configurations/kusto-lookup-stg.tmpl.bicepparam
     deploymentLevel: ResourceGroup
     outputOnly: true
     dependsOn:
@@ -153,3 +158,27 @@ resourceGroups:
       step: action-groups
     - resourceGroup: kusto-infra
       step: detach-legacy-monitoring-stack
+  - name: entity-groups
+    action: KustoEntityGroups
+    entityGroups:
+    - "AllServiceLogs:ServiceLogs"
+    - "AllHostedControlPlaneLogs:HostedControlPlaneLogs"
+    - "AllMonitoringEvents:MonitoringEvents"
+    environment: '{{ .environmentName }}'
+    timeout: "10m"
+    identityFrom:
+      resourceGroup: global
+      step: output
+      name: globalMSIId
+    automatedRetry:
+      errorContainsAny:
+      - "InternalServerError"
+      - "Internal server error"
+      - "connection refused"
+      - "context deadline exceeded"
+      - "missing a valid aroHCPEnvironment tag"
+      maximumRetryCount: 3
+      durationBetweenRetries: 2m
+    dependsOn:
+    - resourceGroup: kusto-infra
+      step: deploy

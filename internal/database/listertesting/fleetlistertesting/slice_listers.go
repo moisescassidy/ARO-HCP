@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package fleetlistertesting provides slice-backed test implementations of the
-// fleet listers (Stamp, ManagementCluster).
+// fleet listers (Stamp, ManagementCluster, ManagementClusterScheduling).
 package fleetlistertesting
 
 import (
@@ -40,7 +40,7 @@ func (l *SliceStampLister) List(ctx context.Context) ([]*fleetapi.Stamp, error) 
 func (l *SliceStampLister) Get(ctx context.Context, stampIdentifier string) (*fleetapi.Stamp, error) {
 	key := fleetapi.ToStampResourceIDString(stampIdentifier)
 	for _, s := range l.Stamps {
-		if s.CosmosMetadata.ResourceID != nil && strings.EqualFold(s.CosmosMetadata.ResourceID.String(), key) {
+		if s.ResourceID != nil && strings.EqualFold(s.ResourceID.String(), key) {
 			return s, nil
 		}
 	}
@@ -83,4 +83,26 @@ func (l *SliceManagementClusterLister) GetByCSProvisionShardID(ctx context.Conte
 	default:
 		return nil, fmt.Errorf("expected at most 1 management cluster for CS provision shard ID %q, got %d", shardID, len(matches))
 	}
+}
+
+// SliceManagementClusterSchedulingLister implements
+// fleetlisters.ManagementClusterSchedulingLister backed by a slice.
+type SliceManagementClusterSchedulingLister struct {
+	Schedulings []*fleetapi.ManagementClusterScheduling
+}
+
+var _ fleetlisters.ManagementClusterSchedulingLister = &SliceManagementClusterSchedulingLister{}
+
+func (l *SliceManagementClusterSchedulingLister) List(ctx context.Context) ([]*fleetapi.ManagementClusterScheduling, error) {
+	return l.Schedulings, nil
+}
+
+func (l *SliceManagementClusterSchedulingLister) Get(ctx context.Context, stampIdentifier string) (*fleetapi.ManagementClusterScheduling, error) {
+	key := fleetapi.ToManagementClusterSchedulingResourceIDString(stampIdentifier)
+	for _, s := range l.Schedulings {
+		if s.ResourceID != nil && strings.EqualFold(s.ResourceID.String(), key) {
+			return s, nil
+		}
+	}
+	return nil, cosmosstorageutils.NewNotFoundError()
 }

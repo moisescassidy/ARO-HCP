@@ -90,7 +90,6 @@ type NodePoolParams20260630 struct {
 	AvailabilityZone string
 	AutoRepair       bool
 	Tags             map[string]*string
-	EncryptionSetID  string
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +161,25 @@ func ConvertToUserAssignedIdentitiesProfile20260630(value interface{}) (*hcpsdk2
 		return nil, fmt.Errorf("failed to unmarshal UserAssignedIdentitiesValue: %w", err)
 	}
 	return &uamis, nil
+}
+
+// ClearUserAssignedIdentityValues20260630 resets every value in a
+// ManagedServiceIdentity's UserAssignedIdentities map to an empty struct,
+// preserving only the map keys (identity resource IDs).
+//
+// ARM requires that on a PUT of an existing resource, UserAssignedIdentities
+// map values for identities that should be kept unchanged are sent back as
+// empty objects ({}); the client/PrincipalID values a prior GET populated
+// must not be echoed back. Callers that Get a cluster, mutate an unrelated
+// field, and then BeginCreateOrUpdate the full object must call this first
+// or ARM rejects the request with error code InvalidIdentityValues.
+func ClearUserAssignedIdentityValues20260630(identity *hcpsdk20260630preview.ManagedServiceIdentity) {
+	if identity == nil {
+		return
+	}
+	for id := range identity.UserAssignedIdentities {
+		identity.UserAssignedIdentities[id] = &hcpsdk20260630preview.UserAssignedIdentity{}
+	}
 }
 
 func ConvertToManagedServiceIdentity20260630(value interface{}) (*hcpsdk20260630preview.ManagedServiceIdentity, error) {
@@ -558,7 +576,7 @@ func CreateHCPClusterAndWait20260630(
 		defer cancel()
 	}
 
-	logger.Info("Starting HCP cluster creation (v20260630preview)", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName)
+	logger.Info("Starting HCP cluster creation (v20260630preview)", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName, "version", cluster.Properties.Version.ID, "channelGroup", cluster.Properties.Version.ChannelGroup)
 	poller, err := hcpClient.BeginCreateOrUpdate(ctx, resourceGroupName, hcpClusterName, cluster, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed starting cluster creation %q in resourcegroup=%q: %w", hcpClusterName, resourceGroupName, err)
@@ -684,10 +702,6 @@ func BuildNodePoolFromParams20260630(
 			},
 			AutoRepair: to.Ptr(parameters.AutoRepair),
 		},
-	}
-
-	if parameters.EncryptionSetID != "" {
-		nodePool.Properties.Platform.OSDisk.EncryptionSetID = to.Ptr(parameters.EncryptionSetID)
 	}
 
 	if parameters.AutoScaling != nil {

@@ -93,7 +93,6 @@ type NodePoolParams20240610 struct {
 	AutoScaling      *NodePoolAutoScalingParams
 	AvailabilityZone string
 	Tags             map[string]*string
-	EncryptionSetID  string
 }
 
 // ========================================================================
@@ -161,6 +160,25 @@ func ConvertToUserAssignedIdentitiesProfile20240610(value interface{}) (*hcpsdk2
 		return nil, fmt.Errorf("failed to unmarshal UserAssignedIdentitiesValue: %w", err)
 	}
 	return &uamis, nil
+}
+
+// ClearUserAssignedIdentityValues20240610 resets every value in a
+// ManagedServiceIdentity's UserAssignedIdentities map to an empty struct,
+// preserving only the map keys (identity resource IDs).
+//
+// ARM requires that on a PUT of an existing resource, UserAssignedIdentities
+// map values for identities that should be kept unchanged are sent back as
+// empty objects ({}); the client/PrincipalID values a prior GET populated
+// must not be echoed back. Callers that Get a cluster, mutate an unrelated
+// field, and then BeginCreateOrUpdate the full object must call this first
+// or ARM rejects the request with error code InvalidIdentityValues.
+func ClearUserAssignedIdentityValues20240610(identity *hcpsdk20240610preview.ManagedServiceIdentity) {
+	if identity == nil {
+		return
+	}
+	for id := range identity.UserAssignedIdentities {
+		identity.UserAssignedIdentities[id] = &hcpsdk20240610preview.UserAssignedIdentity{}
+	}
 }
 
 func ConvertToManagedServiceIdentity20240610(value interface{}) (*hcpsdk20240610preview.ManagedServiceIdentity, error) {
@@ -471,7 +489,9 @@ func (tc *perItOrDescribeTestContext) GetAdminRESTConfigForHCPCluster20240610(
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start credential request: %w", err)
+		// Fall back to the CSR-based 2026-09-01-preview mechanism when the
+		// legacy break-glass credential request cannot be started.
+		return tc.fallbackAdminRESTConfigTo20260901(ctx, resourceGroupName, hcpClusterName, timeout, fmt.Errorf("failed to start credential request: %w", err))
 	}
 
 	operationResult, err := adminCredentialRequestPoller.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{
@@ -481,7 +501,9 @@ func (tc *perItOrDescribeTestContext) GetAdminRESTConfigForHCPCluster20240610(
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("failed waiting for hcpCluster=%q in resourcegroup=%q to finish getting creds, caused by: %w, error: %w", hcpClusterName, resourceGroupName, context.Cause(ctx), err)
 		}
-		return nil, fmt.Errorf("failed waiting for hcpCluster=%q in resourcegroup=%q to finish getting creds: %w", hcpClusterName, resourceGroupName, err)
+		// Fall back to the CSR-based 2026-09-01-preview mechanism when the
+		// legacy break-glass credential request fails after it started.
+		return tc.fallbackAdminRESTConfigTo20260901(ctx, resourceGroupName, hcpClusterName, timeout, fmt.Errorf("failed waiting for hcpCluster=%q in resourcegroup=%q to finish getting creds: %w", hcpClusterName, resourceGroupName, err))
 	}
 
 	switch m := any(operationResult).(type) {
@@ -1058,7 +1080,7 @@ func BeginCreateHCPCluster20240610(
 	location string,
 ) (*runtime.Poller[hcpsdk20240610preview.HcpOpenShiftClustersClientCreateOrUpdateResponse], error) {
 	cluster := BuildHCPClusterFromParams20240610(clusterParams, location)
-	logger.Info("Starting HCP cluster creation", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName)
+	logger.Info("Starting HCP cluster creation", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName, "version", cluster.Properties.Version.ID, "channelGroup", cluster.Properties.Version.ChannelGroup)
 	poller, err := hcpClient.BeginCreateOrUpdate(ctx, resourceGroupName, hcpClusterName, cluster, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed starting cluster creation %q in resourcegroup=%q: %w", hcpClusterName, resourceGroupName, err)
@@ -1260,10 +1282,6 @@ func BuildNodePoolFromParams20240610(
 				AvailabilityZone: to.Ptr(parameters.AvailabilityZone),
 			},
 		},
-	}
-
-	if parameters.EncryptionSetID != "" {
-		nodePool.Properties.Platform.OSDisk.EncryptionSetID = to.Ptr(parameters.EncryptionSetID)
 	}
 
 	if parameters.AutoScaling != nil {

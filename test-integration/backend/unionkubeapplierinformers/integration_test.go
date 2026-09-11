@@ -43,7 +43,6 @@ import (
 	"github.com/Azure/ARO-HCP/internal/database/informers/kubeapplierinformers"
 	unionkubeapplier "github.com/Azure/ARO-HCP/internal/database/unioninformers/kubeapplier"
 	"github.com/Azure/ARO-HCP/internal/utils"
-	"github.com/Azure/ARO-HCP/internal/utils/armhelpers"
 	"github.com/Azure/ARO-HCP/test-integration/utils/integrationutils"
 )
 
@@ -288,7 +287,6 @@ func createStamp(ctx context.Context, fleetClient fleetcosmosstorage.FleetDBClie
 	stampResourceID := metadataapi.Must(fleetapi.ToStampResourceID(stampIdentifier))
 	stamp := &fleetapi.Stamp{
 		CosmosMetadata: coreapi.CosmosMetadata{ResourceID: stampResourceID, PartitionKey: strings.ToLower(stampIdentifier)},
-		ResourceID:     stampResourceID,
 	}
 	_, err := fleetClient.Stamps().Create(ctx, stamp, nil)
 	return err
@@ -304,7 +302,6 @@ func createManagementCluster(ctx context.Context, fleetClient fleetcosmosstorage
 		fmt.Sprintf("/api/aro_hcp/v1alpha1/provision_shards/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeee%s", stampIdentifier))))
 	managementCluster := &fleetapi.ManagementCluster{
 		CosmosMetadata: coreapi.CosmosMetadata{ResourceID: managementClusterResourceID, PartitionKey: strings.ToLower(stampIdentifier)},
-		ResourceID:     managementClusterResourceID,
 		Spec: fleetapi.ManagementClusterSpec{
 			SchedulingPolicy: fleetapi.ManagementClusterSchedulingPolicySchedulable,
 		},
@@ -336,9 +333,9 @@ func createApplyDesire(ctx context.Context, mockClient *kubeappliercosmosstorage
 	var applyDesireCRUD cosmosstorageutils.ResourceCRUD[kubeapplierapi.ApplyDesire, *kubeapplierapi.ApplyDesire]
 	var err error
 	switch {
-	case armhelpers.ResourceTypeEqual(parentType, coreapi.ClusterResourceType):
+	case metadataapi.ResourceTypeEqual(parentType, coreapi.ClusterResourceType):
 		applyDesireCRUD, err = mockClient.ApplyDesiresForCluster(id.SubscriptionID, id.ResourceGroupName, id.Parent.Name)
-	case armhelpers.ResourceTypeEqual(parentType, coreapi.NodePoolResourceType):
+	case metadataapi.ResourceTypeEqual(parentType, coreapi.NodePoolResourceType):
 		applyDesireCRUD, err = mockClient.ApplyDesiresForNodePool(id.SubscriptionID, id.ResourceGroupName, id.Parent.Parent.Name, id.Parent.Name)
 	default:
 		return fmt.Errorf("unsupported *Desire parent resource type: %s", parentType)

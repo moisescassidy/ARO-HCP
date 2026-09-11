@@ -28,6 +28,13 @@ import (
 // FirstChainQuestion is the required question for the first link in the causal chain.
 const FirstChainQuestion = "Why did this test fail?"
 
+// maxConciseProofRows is the largest result set a proof query may return before
+// validation asks the model to tighten it. A proof is meant to be a legible
+// piece of evidence, not a data dump; keeping proofs small also keeps the
+// rendered review document within the model's context window. The threshold is
+// deliberately generous so only genuinely excessive result sets are flagged.
+const maxConciseProofRows = 300
+
 // ValidationContext holds the data needed to validate a DraftChain beyond
 // structural checks — file system paths, log contents, and worktree locations.
 type ValidationContext struct {
@@ -44,6 +51,17 @@ type ValidationContext struct {
 	// NodeConsoleLogs maps console log filenames to their contents.
 	// Used for validating node_console_log proof items.
 	NodeConsoleLogs map[string]string
+	// Intent is the human-written investigation objective. When non-empty the
+	// validator uses intent-mode rules: the first chain question need not match
+	// FirstChainQuestion, no error-log anchor is required, and a non-empty Title
+	// is required. When empty, the strict test-mode rules apply.
+	Intent string
+}
+
+// intentMode reports whether the validation context is for a free-form
+// investigation rather than a failed-test analysis.
+func (vc *ValidationContext) intentMode() bool {
+	return vc != nil && vc.Intent != ""
 }
 
 // ValidationProblem describes a single structured validation issue found in a DraftChain.
@@ -93,6 +111,72 @@ func ValidateDraft(ctx context.Context, client KustoClient, draft *DraftChain, v
 			Detail:   "- The summary is empty. Every analysis must include a non-empty summary.",
 		})
 	}
+	// Classification checks.
+	if draft.Classification == nil {
+		problems = append(problems, ValidationProblem{
+			Category: "missing_classification",
+			Chain:    -1,
+			Proof:    -1,
+			Detail:   "- The classification is missing. Every analysis must include a classification object with l1_category and confidence.",
+		})
+	} else {
+		if !ValidL1Categories[draft.Classification.L1Category] {
+			var allowed []string
+			for cat := range ValidL1Categories {
+				allowed = append(allowed, fmt.Sprintf("%q", cat))
+			}
+			sort.Strings(allowed)
+			problems = append(problems, ValidationProblem{
+				Category: "invalid_l1_category",
+				Chain:    -1,
+				Proof:    -1,
+				Detail: fmt.Sprintf(
+					"- The classification l1_category %q is not valid. Must be one of: %s.",
+					draft.Classification.L1Category, strings.Join(allowed, ", "),
+				),
+			})
+		}
+		if draft.Classification.L1Category == L1ProductFailures {
+			if !ValidL2Subcategories[draft.Classification.L2Subcategory] {
+				var allowed []string
+				for sub := range ValidL2Subcategories {
+					allowed = append(allowed, fmt.Sprintf("%q", sub))
+				}
+				sort.Strings(allowed)
+				problems = append(problems, ValidationProblem{
+					Category: "invalid_l2_subcategory",
+					Chain:    -1,
+					Proof:    -1,
+					Detail: fmt.Sprintf(
+						"- When l1_category is %q, l2_subcategory must be one of: %s. Got %q.",
+						L1ProductFailures, strings.Join(allowed, ", "), draft.Classification.L2Subcategory,
+					),
+				})
+			}
+		} else if draft.Classification.L2Subcategory != "" {
+			problems = append(problems, ValidationProblem{
+				Category: "unexpected_l2_subcategory",
+				Chain:    -1,
+				Proof:    -1,
+				Detail: fmt.Sprintf(
+					"- l2_subcategory should be omitted when l1_category is %q (l2 is only for %q).",
+					draft.Classification.L1Category, L1ProductFailures,
+				),
+			})
+		}
+		if draft.Classification.Confidence < 0 || draft.Classification.Confidence > 1 {
+			problems = append(problems, ValidationProblem{
+				Category: "invalid_confidence",
+				Chain:    -1,
+				Proof:    -1,
+				Detail: fmt.Sprintf(
+					"- The classification confidence must be between 0 and 1, got %g.",
+					draft.Classification.Confidence,
+				),
+			})
+		}
+	}
+
 	if len(draft.Chain) == 0 {
 		problems = append(problems, ValidationProblem{
 			Category: "empty_chain",
@@ -101,8 +185,18 @@ func ValidateDraft(ctx context.Context, client KustoClient, draft *DraftChain, v
 			Detail:   "- The chain is empty. Every analysis must include at least one causal chain link.",
 		})
 	}
+	// In intent mode the analysis must carry a model-authored title, used as the
+	// rendered document heading. Test mode falls back to the test name.
+	if vc.intentMode() && draft.Title == "" {
+		problems = append(problems, ValidationProblem{
+			Category: "empty_title",
+			Chain:    -1,
+			Proof:    -1,
+			Detail:   "- The title is empty. In an intent-driven investigation, provide a short title headlining the finding.",
+		})
+	}
 	for i, link := range draft.Chain {
-		if i == 0 && link.Question != FirstChainQuestion {
+		if i == 0 && !vc.intentMode() && link.Question != FirstChainQuestion {
 			problems = append(problems, ValidationProblem{
 				Category: "wrong_first_question",
 				Chain:    i,
@@ -319,9 +413,10 @@ func ValidateDraft(ctx context.Context, client KustoClient, draft *DraftChain, v
 			}
 		}
 
-		// The first chain link must include at least one log proof referencing
-		// the test error log, so readers always see the failure output.
-		if i == 0 {
+		// In test mode, the first chain link must include at least one log proof
+		// referencing the test error log, so readers always see the failure
+		// output. Intent-driven investigations have no such anchor requirement.
+		if i == 0 && !vc.intentMode() {
 			hasErrorLog := false
 			for _, proof := range link.Proof {
 				if proof.Type == "log" && proof.Source == "error" {
@@ -433,6 +528,20 @@ func ValidateDraft(ctx context.Context, client KustoClient, draft *DraftChain, v
 						"use a `summarize count=count()` and explicitly show a zero count instead of an empty result set.\n"+
 						"  Query:\n  ```kql\n  %s\n  ```",
 					where, loc.KQL,
+				),
+			})
+		} else if len(table.Rows) > maxConciseProofRows {
+			problems = append(problems, ValidationProblem{
+				Category: "kql_excessive_rows",
+				Chain:    loc.ChainIndex,
+				Proof:    loc.ProofIndex,
+				Detail: fmt.Sprintf(
+					"- %s: KQL query returned %d rows — far more than a legible proof needs. Evidence should be "+
+						"concise enough that a reader sees at a glance how it supports the claim. Tighten it: "+
+						"`summarize`/aggregate, narrow the `where` filters, `project` only the relevant columns, or "+
+						"`top`/`take` a bounded, meaningful set. If a long series is genuinely the point (e.g. a "+
+						"timeline), reduce it to the transitions that matter.\n  Query:\n  ```kql\n  %s\n  ```",
+					where, len(table.Rows), loc.KQL,
 				),
 			})
 		}

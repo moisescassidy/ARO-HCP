@@ -25,15 +25,20 @@ import (
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 
+	hyperv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+
+	"github.com/Azure/ARO-HCP/backend/pkg/kubeapplierhelpers"
 	"github.com/Azure/ARO-HCP/backend/pkg/utils/controllerutils"
 	"github.com/Azure/ARO-HCP/internal/api/coreapi"
 	"github.com/Azure/ARO-HCP/internal/api/fleetapi"
 	"github.com/Azure/ARO-HCP/internal/api/kubeapplierapi"
 	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 	"github.com/Azure/ARO-HCP/internal/backup"
+	internalcontrollerutils "github.com/Azure/ARO-HCP/internal/controllerutils"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstoragetesting/corecosmosstoragetesting"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstoragetesting/kubeappliercosmosstoragetesting"
@@ -78,7 +83,7 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 	newSyncer := func(clients *kubeappliercosmosstoragetesting.MockKubeApplierDBClients) *backupScheduleSyncer {
 		mcLister := &fleetlistertesting.SliceManagementClusterLister{
 			ManagementClusters: []*fleetapi.ManagementCluster{
-				{ResourceID: managementClusterResourceID},
+				{CosmosMetadata: coreapi.CosmosMetadata{ResourceID: managementClusterResourceID}},
 			},
 		}
 		return &backupScheduleSyncer{
@@ -106,7 +111,7 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 
 		syncer := newSyncer(mockClients)
 		_, err := syncer.deleteStaleApplyDesires(context.Background(), testKey, applyDesireCRUD,
-			[]*kubeapplierapi.ApplyDesire{makeDesiredApplyDesire(backup.BackupScheduleDesireNamePrefix + "current")})
+			map[string]bool{backup.BackupScheduleDesireNamePrefix + "current": true})
 		require.NoError(t, err)
 
 		applyDesire, err := applyDesireCRUD.Get(context.Background(), backup.BackupScheduleDesireNamePrefix+"old")
@@ -119,30 +124,28 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 		assert.NoError(t, err, "desired ApplyDesire should still exist")
 	})
 
-	t.Run("removes Delete-type ApplyDesire when ReadDesire confirms object gone", func(t *testing.T) {
+	t.Run("removes Delete-type ApplyDesire once its delete has succeeded", func(t *testing.T) {
 		mockKubeApplier := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClient()
 		mockClients := kubeappliercosmosstoragetesting.NewMockKubeApplierDBClients()
 		mockClients.Register(managementClusterResourceID, mockKubeApplier)
 
 		applyDesireCRUD, _ := mockKubeApplier.ApplyDesiresForCluster("test-sub", "test-rg", "test-cluster")
-		readDesireCRUD, _ := mockKubeApplier.ReadDesiresForCluster("test-sub", "test-rg", "test-cluster")
 
+		// EnsureApplyDesireRemoved purges a Delete-type ApplyDesire once the
+		// ApplyDesire's own delete condition reports success.
 		staleApplyDesire := makeDesiredApplyDesire(backup.BackupScheduleDesireNamePrefix + "old")
 		staleApplyDesire.Spec.Type = kubeapplierapi.ApplyDesireTypeDelete
-		_, _ = applyDesireCRUD.Create(context.Background(), staleApplyDesire, nil)
-
-		rd := makeReadDesire(backup.BackupScheduleDesireNamePrefix + "old")
-		rd.Status.Conditions = []metav1.Condition{
-			{Type: kubeapplierapi.ConditionTypeSuccessful, Status: metav1.ConditionTrue},
+		staleApplyDesire.Status.Conditions = []metav1.Condition{
+			{Type: kubeapplierapi.ConditionTypeSuccessfullyDeleted, Status: metav1.ConditionTrue},
 		}
-		_, _ = readDesireCRUD.Create(context.Background(), rd, nil)
+		_, _ = applyDesireCRUD.Create(context.Background(), staleApplyDesire, nil)
 
 		syncer := newSyncer(mockClients)
 		requeue, err := syncer.deleteStaleApplyDesires(context.Background(), testKey, applyDesireCRUD, nil)
 		require.NoError(t, err)
 		assert.True(t, requeue)
 		_, err = applyDesireCRUD.Get(context.Background(), backup.BackupScheduleDesireNamePrefix+"old")
-		assert.True(t, cosmosstorageutils.IsNotFoundError(err), "Delete-type ApplyDesire should be purged when ReadDesire confirms object gone")
+		assert.True(t, cosmosstorageutils.IsNotFoundError(err), "Delete-type ApplyDesire should be purged once its delete has succeeded")
 	})
 
 	t.Run("leaves Delete-type ApplyDesire when ReadDesire has not yet synced", func(t *testing.T) {
@@ -209,7 +212,7 @@ func TestDeleteStaleApplyDesires(t *testing.T) {
 
 		syncer := newSyncer(mockClients)
 		requeue, err := syncer.deleteStaleApplyDesires(context.Background(), testKey, applyDesireCRUD,
-			[]*kubeapplierapi.ApplyDesire{scheduleDesire})
+			map[string]bool{backup.BackupScheduleDesireNamePrefix + "hourly": true})
 		require.NoError(t, err)
 		assert.False(t, requeue)
 
@@ -243,7 +246,7 @@ func TestDeleteStaleReadDesires(t *testing.T) {
 	newSyncer := func(clients *kubeappliercosmosstoragetesting.MockKubeApplierDBClients) *backupScheduleSyncer {
 		mcLister := &fleetlistertesting.SliceManagementClusterLister{
 			ManagementClusters: []*fleetapi.ManagementCluster{
-				{ResourceID: managementClusterResourceID},
+				{CosmosMetadata: coreapi.CosmosMetadata{ResourceID: managementClusterResourceID}},
 			},
 		}
 		return &backupScheduleSyncer{
@@ -455,6 +458,38 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 		}
 	}
 
+	// seedHostedClusterReadDesire creates the ReadDesire that mirrors the live
+	// HostedCluster's observed encryption status, matching the pattern used by
+	// key_rotation_controller_test.go's completedRotationHC/migratingHC helpers.
+	seedHostedClusterReadDesire := func(t *testing.T, ctx context.Context, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient, keyVaultName, keyName, keyVersion string) {
+		t.Helper()
+		hc := &hyperv1beta1.HostedCluster{}
+		hc.Status.SecretEncryption = hyperv1beta1.SecretEncryptionStatus{
+			ActiveKey: hyperv1beta1.SecretEncryptionKeyStatus{
+				Azure: hyperv1beta1.AzureKMSKey{KeyVaultName: keyVaultName, KeyName: keyName, KeyVersion: keyVersion},
+			},
+		}
+		raw, err := json.Marshal(hc)
+		require.NoError(t, err)
+		rdResourceIDStr := kubeapplierapi.ToClusterScopedReadDesireResourceIDString(
+			testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName,
+			kubeapplierhelpers.ReadDesireNameReadonlyHostedCluster,
+		)
+		readDesire := &kubeapplierapi.ReadDesire{
+			CosmosMetadata: coreapi.CosmosMetadata{
+				ResourceID:   metadataapi.Must(azcorearm.ParseResourceID(rdResourceIDStr)),
+				PartitionKey: strings.ToLower(testMgmtClusterResourceID().String()),
+			},
+			Status: kubeapplierapi.ReadDesireStatus{
+				KubeContent: &runtime.RawExtension{Raw: raw},
+			},
+		}
+		readDesireCRUD, err := mockKubeApplier.ReadDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
+		require.NoError(t, err)
+		_, err = readDesireCRUD.Create(ctx, readDesire, nil)
+		require.NoError(t, err)
+	}
+
 	seedAllDesiresForConfig := func(t *testing.T, ctx context.Context, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient, config *BackupConfig) ([]*kubeapplierapi.ApplyDesire, []*kubeapplierapi.ReadDesire) {
 		t.Helper()
 		controlPlaneNamespace := fmt.Sprintf("%s-%s", hostedClusterNamespace, testDomainPrefix)
@@ -462,7 +497,7 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 		configSchedules := config.Schedules()
 		schedules := make([]*velerov1api.Schedule, 0, len(configSchedules))
 		for _, scheduleConfig := range configSchedules {
-			schedules = append(schedules, NewScheduledBackup(testArmResourceIDStr, hostedClusterNamespace, controlPlaneNamespace, scheduleConfig, false))
+			schedules = append(schedules, NewScheduledBackup(testArmResourceIDStr, "", hostedClusterNamespace, controlPlaneNamespace, scheduleConfig, false))
 		}
 		applyDesires, err := buildApplyDesiresFromSchedules(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName, managementClusterResourceID, schedules)
 		require.NoError(t, err)
@@ -620,9 +655,10 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 				BackupCadenceProfile: BackupCadenceTesting,
 			},
 			// Testing cadence has 1 schedule (10min); production has 3 (hourly, daily, weekly).
-			// One mutation per reconcile: 2 syncs to create 10min pair +
-			// 3 syncs to mark hourly/daily/weekly as Delete = 5.
-			syncCount: 5,
+			// 2 syncs to create the 10min pair (one create per reconcile), then a
+			// single sync flips all three stale desires (hourly/daily/weekly) to
+			// Delete in one pass via EnsureApplyDesireRemoved = 3.
+			syncCount: 3,
 			verify: func(t *testing.T, ctx context.Context, _ *corecosmosstoragetesting.MockResourcesDBClient, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient) {
 				t.Helper()
 				applyDesireCRUD, err := mockKubeApplier.ApplyDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
@@ -670,23 +706,23 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 				t.Helper()
 				applyDesireCRUD, err := mockKubeApplier.ApplyDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
 				require.NoError(t, err)
-				readDesireCRUD, err := mockKubeApplier.ReadDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
-				require.NoError(t, err)
 				iter, err := applyDesireCRUD.List(ctx, nil)
 				require.NoError(t, err)
 				for _, ad := range iter.Items(ctx) {
 					if ad.Spec.Type != kubeapplierapi.ApplyDesireTypeDelete {
 						continue
 					}
-					rd, err := readDesireCRUD.Get(ctx, ad.ResourceID.Name)
+					// Simulate kube-applier confirming the delete succeeded.
+					// EnsureApplyDesireRemoved gates the purge on the ApplyDesire's
+					// own delete condition, so set it here.
+					current, err := applyDesireCRUD.Get(ctx, ad.ResourceID.Name)
 					if err != nil {
 						continue
 					}
-					rd.Status.KubeContent = nil
-					rd.Status.Conditions = []metav1.Condition{
-						{Type: kubeapplierapi.ConditionTypeSuccessful, Status: metav1.ConditionTrue},
+					current.Status.Conditions = []metav1.Condition{
+						{Type: kubeapplierapi.ConditionTypeSuccessfullyDeleted, Status: metav1.ConditionTrue},
 					}
-					_, err = readDesireCRUD.Replace(ctx, rd, nil)
+					_, err = applyDesireCRUD.Replace(ctx, current, nil)
 					require.NoError(t, err)
 				}
 			},
@@ -890,6 +926,154 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 			},
 		},
 		{
+			name: "updates schedule annotation when KMS key rotates",
+			seedDB: func(t *testing.T, ctx context.Context, mockDB *corecosmosstoragetesting.MockResourcesDBClient) {
+				t.Helper()
+				_, err := mockDB.HCPClusters(testKey.SubscriptionID, testKey.ResourceGroupName).Create(ctx, newTestCluster(func(c *coreapi.HCPOpenShiftCluster) {
+					c.CustomerProperties.Etcd.DataEncryption.CustomerManaged = &coreapi.CustomerManagedEncryptionProfile{
+						Kms: &coreapi.KmsEncryptionProfile{
+							ActiveKey: coreapi.KmsKey{Version: "v2", Name: "key1", VaultName: "vault1"},
+						},
+					}
+				}), nil)
+				require.NoError(t, err)
+			},
+			clusterOpts: []func(*coreapi.HCPOpenShiftCluster){func(c *coreapi.HCPOpenShiftCluster) {
+				c.CustomerProperties.Etcd.DataEncryption.CustomerManaged = &coreapi.CustomerManagedEncryptionProfile{
+					Kms: &coreapi.KmsEncryptionProfile{
+						ActiveKey: coreapi.KmsKey{Version: "v2", Name: "key1", VaultName: "vault1"},
+					},
+				}
+			}},
+			hasPlacement: true,
+			seedKubeApplier: func(t *testing.T, ctx context.Context, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient) ([]*kubeapplierapi.ApplyDesire, []*kubeapplierapi.ReadDesire) {
+				t.Helper()
+				hostedClusterNamespace := controllerutils.HostedClusterNamespace(testEnvID, testClusterID)
+				controlPlaneNamespace := fmt.Sprintf("%s-%s", hostedClusterNamespace, testDomainPrefix)
+				managementClusterResourceID := testMgmtClusterResourceID()
+
+				oldFingerprint := backup.AzureKMSKeyFingerprint("vault1", "key1", "v1")
+				configSchedules := testBackupConfig.Schedules()
+				oldSchedules := make([]*velerov1api.Schedule, 0, len(configSchedules))
+				for _, scheduleConfig := range configSchedules {
+					oldSchedules = append(oldSchedules, NewScheduledBackup(testArmResourceIDStr, oldFingerprint, hostedClusterNamespace, controlPlaneNamespace, scheduleConfig, false))
+				}
+
+				applyDesires, err := buildApplyDesiresFromSchedules(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName, managementClusterResourceID, oldSchedules)
+				require.NoError(t, err)
+				applyDesireCRUD, err := mockKubeApplier.ApplyDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
+				require.NoError(t, err)
+				for _, applyDesire := range applyDesires {
+					_, err := applyDesireCRUD.Create(ctx, applyDesire, nil)
+					require.NoError(t, err)
+				}
+
+				readDesireCRUD, err := mockKubeApplier.ReadDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
+				require.NoError(t, err)
+				var readDesires []*kubeapplierapi.ReadDesire
+				for _, applyDesire := range applyDesires {
+					rdResourceIDStr := kubeapplierapi.ToClusterScopedReadDesireResourceIDString(
+						testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName, applyDesire.ResourceID.Name,
+					)
+					rdResourceID := metadataapi.Must(azcorearm.ParseResourceID(rdResourceIDStr))
+					readDesire := &kubeapplierapi.ReadDesire{
+						CosmosMetadata: coreapi.CosmosMetadata{ResourceID: rdResourceID, PartitionKey: applyDesire.PartitionKey},
+						Spec: kubeapplierapi.ReadDesireSpec{
+							ManagementCluster: applyDesire.Spec.ManagementCluster,
+							TargetItem:        applyDesire.Spec.TargetItem,
+						},
+						Tags: applyDesire.Tags,
+					}
+					_, err := readDesireCRUD.Create(ctx, readDesire, nil)
+					require.NoError(t, err)
+					readDesires = append(readDesires, readDesire)
+				}
+
+				// The live HostedCluster mirror confirms etcd is already
+				// re-encrypted with the new key, so the schedule can pick it up.
+				seedHostedClusterReadDesire(t, ctx, mockKubeApplier, "vault1", "key1", "v2")
+
+				return applyDesires, readDesires
+			},
+			// 3 production schedules need updating (one per sync)
+			syncCount: 3,
+			verify: func(t *testing.T, ctx context.Context, _ *corecosmosstoragetesting.MockResourcesDBClient, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient) {
+				t.Helper()
+				applyDesireCRUD, err := mockKubeApplier.ApplyDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
+				require.NoError(t, err)
+
+				for _, scheduleConfig := range testBackupConfig.Schedules() {
+					desireName := backupApplyDesireName(fmt.Sprintf("%s-%s", testSchedulePrefix, scheduleConfig.Name))
+					applyDesire, err := applyDesireCRUD.Get(ctx, desireName)
+					require.NoError(t, err, "ApplyDesire %s should exist", desireName)
+					assert.Equal(t, kubeapplierapi.ApplyDesireTypeServerSideApply, applyDesire.Spec.Type)
+					require.NotNil(t, applyDesire.Spec.ServerSideApply)
+
+					var got velerov1api.Schedule
+					require.NoError(t, json.Unmarshal(applyDesire.Spec.ServerSideApply.KubeContent.Raw, &got))
+					expectedFingerprint := backup.AzureKMSKeyFingerprint("vault1", "key1", "v2")
+					assert.Equal(t, expectedFingerprint, got.Annotations[internalcontrollerutils.HcpClusterKmsKeyFingerprintAnnotation],
+						"%s should have updated KMS key fingerprint annotation", scheduleConfig.Name)
+				}
+			},
+		},
+		{
+			// Regression guard: a customer-requested rotation must not be reflected
+			// in the schedule annotation until the live HostedCluster confirms etcd
+			// has actually been re-encrypted with the new key. Otherwise a scheduled
+			// backup taken mid-rotation would be tagged with a key that doesn't
+			// match the data's real encryption state.
+			name: "does not advance annotation ahead of the live HostedCluster during an in-flight rotation",
+			seedDB: func(t *testing.T, ctx context.Context, mockDB *corecosmosstoragetesting.MockResourcesDBClient) {
+				t.Helper()
+				_, err := mockDB.HCPClusters(testKey.SubscriptionID, testKey.ResourceGroupName).Create(ctx, newTestCluster(func(c *coreapi.HCPOpenShiftCluster) {
+					c.CustomerProperties.Etcd.DataEncryption.CustomerManaged = &coreapi.CustomerManagedEncryptionProfile{
+						Kms: &coreapi.KmsEncryptionProfile{
+							ActiveKey: coreapi.KmsKey{Version: "v2", Name: "key1", VaultName: "vault1"},
+						},
+					}
+				}), nil)
+				require.NoError(t, err)
+			},
+			clusterOpts: []func(*coreapi.HCPOpenShiftCluster){func(c *coreapi.HCPOpenShiftCluster) {
+				c.CustomerProperties.Etcd.DataEncryption.CustomerManaged = &coreapi.CustomerManagedEncryptionProfile{
+					Kms: &coreapi.KmsEncryptionProfile{
+						// Customer already requested v2, but the HostedCluster
+						// mirror seeded below still shows v1 as active.
+						ActiveKey: coreapi.KmsKey{Version: "v2", Name: "key1", VaultName: "vault1"},
+					},
+				}
+			}},
+			hasPlacement: true,
+			seedKubeApplier: func(t *testing.T, ctx context.Context, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient) ([]*kubeapplierapi.ApplyDesire, []*kubeapplierapi.ReadDesire) {
+				t.Helper()
+				// Rotation is still in flight: etcd is actually still encrypted
+				// with v1.
+				seedHostedClusterReadDesire(t, ctx, mockKubeApplier, "vault1", "key1", "v1")
+				return nil, nil
+			},
+			// 3 production schedules × 2 desires each = 6 syncs to create them all.
+			syncCount: 6,
+			verify: func(t *testing.T, ctx context.Context, _ *corecosmosstoragetesting.MockResourcesDBClient, mockKubeApplier *kubeappliercosmosstoragetesting.MockKubeApplierDBClient) {
+				t.Helper()
+				applyDesireCRUD, err := mockKubeApplier.ApplyDesiresForCluster(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName)
+				require.NoError(t, err)
+
+				expectedFingerprint := backup.AzureKMSKeyFingerprint("vault1", "key1", "v1")
+				for _, scheduleConfig := range testBackupConfig.Schedules() {
+					desireName := backupApplyDesireName(fmt.Sprintf("%s-%s", testSchedulePrefix, scheduleConfig.Name))
+					applyDesire, err := applyDesireCRUD.Get(ctx, desireName)
+					require.NoError(t, err, "ApplyDesire %s should exist", desireName)
+					require.NotNil(t, applyDesire.Spec.ServerSideApply)
+
+					var got velerov1api.Schedule
+					require.NoError(t, json.Unmarshal(applyDesire.Spec.ServerSideApply.KubeContent.Raw, &got))
+					assert.Equal(t, expectedFingerprint, got.Annotations[internalcontrollerutils.HcpClusterKmsKeyFingerprintAnnotation],
+						"%s must be tagged with the actually-active key (v1), not the customer-desired key (v2), while rotation is in flight", scheduleConfig.Name)
+				}
+			},
+		},
+		{
 			name: "updates existing production desires when config parameters change",
 			seedDB: func(t *testing.T, ctx context.Context, mockDB *corecosmosstoragetesting.MockResourcesDBClient) {
 				t.Helper()
@@ -911,7 +1095,7 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 
 				oldSchedules := []*velerov1api.Schedule{}
 				for _, schedule := range schedules {
-					oldSchedules = append(oldSchedules, NewScheduledBackup(testArmResourceIDStr, hostedClusterNamespace, controlPlaneNamespace, schedule, false))
+					oldSchedules = append(oldSchedules, NewScheduledBackup(testArmResourceIDStr, "", hostedClusterNamespace, controlPlaneNamespace, schedule, false))
 				}
 
 				applyDesires, err := buildApplyDesiresFromSchedules(testKey.SubscriptionID, testKey.ResourceGroupName, testKey.HCPClusterName, managementClusterResourceID, oldSchedules)
@@ -996,7 +1180,7 @@ func TestBackupScheduleSyncer_SyncOnce(t *testing.T) {
 
 			mcLister := &fleetlistertesting.SliceManagementClusterLister{
 				ManagementClusters: []*fleetapi.ManagementCluster{
-					{ResourceID: testMgmtClusterResourceID()},
+					{CosmosMetadata: coreapi.CosmosMetadata{ResourceID: testMgmtClusterResourceID()}},
 				},
 			}
 

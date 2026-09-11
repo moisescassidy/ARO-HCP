@@ -116,19 +116,38 @@ type ServerSideApplyConfig struct {
 	// A nil pointer (or one with an empty Raw) is treated as a pre-check
 	// failure: the kube-applier needs an object to apply.
 	//
-	// The kube-applier always issues SSA with FieldManager="aro-hcp-kube-applier".
-	// The manager name is intentionally not configurable via this API: every
-	// field the kube-applier owns on the cluster traces to that one string,
-	// so an operator inspecting fieldsV1 metadata can attribute ownership at
-	// a glance.
+	// By default the kube-applier issues SSA with
+	// FieldManager="aro-hcp-kube-applier", so that every field the kube-applier
+	// owns on the cluster traces to that one string and an operator inspecting
+	// fieldsV1 metadata can attribute ownership at a glance. That default can be
+	// overridden per-desire via the FieldManager field below.
 	KubeContent *runtime.RawExtension `json:"kubeContent,omitempty"`
+
+	// FieldManager optionally overrides the server-side-apply field-manager
+	// name used for this desire. When nil or empty, the kube-applier uses its
+	// default manager name ("aro-hcp-kube-applier"). When set to a non-empty
+	// value, that value is used verbatim as the SSA FieldManager.
+	//
+	// This exists to support migrating field ownership cleanly from another
+	// manager (e.g. cluster-service): applying as the manager that currently
+	// owns the fields lets the kube-applier adopt them without a conflict,
+	// after which subsequent desires can drop back to the default.
+	FieldManager *string `json:"fieldManager,omitempty"`
 }
 
 type ApplyDesireStatus struct {
 	// Conditions reports per-desire reconciliation status. Well-known types:
-	//   - "Successful": the operation succeeded (SSA applied, or target deleted).
-	//     For Delete, Successful=True means the target is gone. While finalizers
-	//     are running, Successful stays False with reason "WaitingForDeletion".
+	//   - "SuccessfullyApplied": set for Type=ServerSideApply. True means the SSA
+	//                   succeeded.
+	//   - "SuccessfullyDeleted": set for Type=Delete. True means the target is
+	//                   gone. While finalizers are running it stays False with
+	//                   reason "WaitingForDeletion".
+	//   - "Successful": retained for backwards compatibility. It mirrors whichever
+	//                   operation-specific condition applies (SuccessfullyApplied
+	//                   for ServerSideApply, SuccessfullyDeleted for Delete) with
+	//                   the same status/reason/message. Prefer the
+	//                   operation-specific condition; see
+	//                   kubeapplierapihelpers.IsConditionTruePreferring.
 	//   - "Degraded":   the controller is not making progress for an
 	//                   out-of-band reason.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

@@ -95,7 +95,6 @@ type NodePoolParams20260901 struct {
 	AvailabilityZone string
 	AutoRepair       bool
 	Tags             map[string]*string
-	EncryptionSetID  string
 }
 
 // --- Functions from deployment_params.go ---
@@ -544,7 +543,7 @@ func CreateHCPClusterAndWait20260901(
 		defer cancel()
 	}
 
-	logger.Info("Starting HCP cluster creation (v20260901preview)", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName)
+	logger.Info("Starting HCP cluster creation (v20260901preview)", "clusterName", hcpClusterName, "resourceGroup", resourceGroupName, "version", cluster.Properties.Version.ID, "channelGroup", cluster.Properties.Version.ChannelGroup)
 	poller, err := hcpClient.BeginCreateOrUpdate(ctx, resourceGroupName, hcpClusterName, cluster, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed starting cluster creation %q in resourcegroup=%q: %w", hcpClusterName, resourceGroupName, err)
@@ -663,10 +662,6 @@ func BuildNodePoolFromParams20260901(
 		},
 	}
 
-	if parameters.EncryptionSetID != "" {
-		nodePool.Properties.Platform.OSDisk.EncryptionSetID = to.Ptr(parameters.EncryptionSetID)
-	}
-
 	if parameters.AutoScaling != nil {
 		nodePool.Properties.AutoScaling = &hcpsdk20260901preview.NodePoolAutoScaling{
 			Min: to.Ptr(parameters.AutoScaling.Min),
@@ -772,6 +767,30 @@ func (tc *perItOrDescribeTestContext) get20260901ClientFactoryUnlocked(ctx conte
 	return tc.clientFactory20260901, nil
 }
 
+// fallbackAdminRESTConfigTo20260901 re-requests admin credentials via the
+// CSR-based 2026-09-01-preview API version. Used when the legacy 20240610
+// admin credential path fails, so tests keep working once break-glass
+// issuance is no longer served for the stable 20240610 API version. Both the
+// originating 20240610 error and any 2026-09-01-preview error are wrapped so a
+// failure on either path stays diagnosable.
+func (tc *perItOrDescribeTestContext) fallbackAdminRESTConfigTo20260901(
+	ctx context.Context,
+	resourceGroupName string,
+	hcpClusterName string,
+	timeout time.Duration,
+	causeErr error,
+) (*rest.Config, error) {
+	fallbackFactory, fallbackErr := tc.Get20260901ClientFactory(ctx)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("20240610 credential request failed: %w; fallback client factory error: %w", causeErr, fallbackErr)
+	}
+	restConfig, fallbackErr := tc.GetAdminRESTConfigForHCPCluster20260901(ctx, fallbackFactory.NewHcpOpenShiftClustersClient(), resourceGroupName, hcpClusterName, timeout)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("20240610 credential request failed: %w; 2026-09-01-preview fallback failed: %w", causeErr, fallbackErr)
+	}
+	return restConfig, nil
+}
+
 func (tc *perItOrDescribeTestContext) GetAdminRESTConfigForHCPCluster20260901(
 	ctx context.Context,
 	hcpClient *hcpsdk20260901preview.HcpOpenShiftClustersClient,
@@ -814,12 +833,7 @@ func (tc *perItOrDescribeTestContext) GetAdminRESTConfigForHCPCluster20260901(
 		nil,
 	)
 	if err != nil {
-		// Fall back to the old 0240610 mechanism during the transition period.
-		fallbackFactory, fallbackErr := tc.Get20240610ClientFactory(ctx)
-		if fallbackErr != nil {
-			return nil, fmt.Errorf("0901 credential request failed: %w; fallback client factory error: %w", err, fallbackErr)
-		}
-		return tc.GetAdminRESTConfigForHCPCluster20240610(ctx, fallbackFactory.NewHcpOpenShiftClustersClient(), resourceGroupName, hcpClusterName, timeout)
+		return nil, fmt.Errorf("failed to begin admin credential request for hcpCluster=%q in resourcegroup=%q: %w", hcpClusterName, resourceGroupName, err)
 	}
 
 	operationResult, err := adminCredentialRequestPoller.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{

@@ -20,6 +20,8 @@ import (
 	"github.com/go-logr/logr"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v3"
 
 	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/steps/common"
@@ -189,6 +191,27 @@ func TestRoleAssignmentName_FallsBackToID(t *testing.T) {
 
 	if got, want := roleAssignmentName(role, "fallback-id"), "fallback-id"; got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestSelectOrphanedRoleAssignments(t *testing.T) {
+	t.Parallel()
+
+	assignments := []roleAssignmentRecord{
+		{ID: "active-assignment", PrincipalID: "active-principal"},
+		{ID: "soft-deleted-assignment", PrincipalID: "soft-deleted-principal"},
+		{ID: "absent-assignment", PrincipalID: "absent-principal"},
+		{ID: "ABSENT-ASSIGNMENT", PrincipalID: "absent-principal"},
+		{ID: "missing-principal-assignment"},
+	}
+	resolvedPrincipalIDs := sets.New("active-principal")
+
+	got := selectOrphanedRoleAssignments(assignments, resolvedPrincipalIDs)
+	if len(got) != 2 {
+		t.Fatalf("expected two orphaned assignments, got %#v", got)
+	}
+	if got[0].ID != "soft-deleted-assignment" || got[1].ID != "absent-assignment" {
+		t.Fatalf("expected soft-deleted and absent principal assignments, got %#v", got)
 	}
 }
 

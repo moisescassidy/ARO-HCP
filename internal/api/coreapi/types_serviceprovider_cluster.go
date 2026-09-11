@@ -114,6 +114,31 @@ type ServiceProviderClusterSpec struct {
 	// BackupScheduleState is the desired backup scheduling state: Enabled or Disabled.
 	// Default is Enabled. Set to Disabled via Admin API to pause scheduled backups.
 	BackupScheduleState BackupScheduleState `json:"backupScheduleState,omitempty"`
+
+	// ManagementClusterResourceID is the resource ID of the management cluster the
+	// scheduler has selected for this HCP. This is the scheduler's intent (desired
+	// placement): nil means placement has not been resolved yet. Downstream
+	// controllers (cluster creation gating and Cluster Service provision-shard
+	// pinning) rely on it once set.
+	//
+	// It is set once by the PlacementController and is not otherwise mutated.
+	// Written by: PlacementController
+	ManagementClusterResourceID *azcorearm.ResourceID `json:"managementClusterResourceID,omitempty"`
+
+	// EarliestRecheckTimesByController records, per controller, the earliest time
+	// at which that controller should next re-query Azure (or another external
+	// system) for the state it maintains. The map key is the controller's
+	// ControllerName constant; a nil or absent entry means recheck immediately.
+	// Centralizing these per-controller recheck times here lets each controller
+	// avoid repeatedly hitting an external API to confirm the desired state is
+	// still true, without every tracked struct carrying its own recheck field.
+	// Controllers should set their entry with substantial jitter: without another
+	// concern, jitter of 50% is considered normal so that any storms are quickly
+	// dissipated. Additionally, long recheck times are recommended for resources
+	// outside of their active phases. Order of at least six hours is, with
+	// durations up to 24 hours considered normal.
+	// Written by: FetchMSIIdentitiesInfo, FetchDataPlaneOperatorsManagedIdentitiesInfoController, IdentityRoleAssignments
+	EarliestRecheckTimesByController map[string]*metav1.Time `json:"earliestRecheckTimesByController,omitempty"`
 }
 
 // ServiceProviderClusterSpecVersion contains the desired version information.
@@ -232,14 +257,161 @@ type ServiceProviderClusterStatus struct {
 	// AzureResources tracks the lifecycle of Azure resources associated with
 	// the cluster, including deny assignments and the managed resource group.
 	AzureResources AzureResources `json:"azureResources,omitempty"`
+
+	// MSIManagedIdentities tracks resolved ClientID/PrincipalID for
+	// the Managed Service Identity (MSI) based Azure User-Assigned Managed Identities
+	// associated to the cluster. Those are the cluster's control plane operators and
+	// the cluster's service managed identity.
+	// A cluster's control plane operator is a kubernetes operator associated to
+	// the cluster that runs in the cluster's control plane. For example,
+	// the Cluster's CustomerProperties.Platform.OperatorsAuthentication.UserAssignedIdentities.ControlPlaneOperators
+	// map contains (and is not limited to) the set of required control plane operators associated to a Cluster.
+	// The cluster's service managed identity is used to read and modify
+	// customer-provided Azure resources (for example the cluster subnet),
+	// subject to the permissions granted to that identity.
+	// MSI-based user-assigned managed identities are the identities defined in
+	// the Cluster's `identity` section. Credentials for those identities can be
+	// obtained from Microsoft's Managed Identities Data Plane service.
+	// In ARO-HCP environments where Microsoft's Managed Identities Data Plane
+	// service is unavailable, a fake Managed Identities Data Plane client is
+	// used. That client always returns the same identity metadata and
+	// credentials, regardless of which identity is requested. The returned
+	// values belong to the "MI Mock" identity, so the ClientID and PrincipalID
+	// stored for each entry here will not match that entry's ResourceID key,
+	// nor the real ClientID/PrincipalID of the corresponding identity in the
+	// Cluster's `identity` section.
+	// Additionally, this also tracks when Azure should next be re-queried for that info.
+	// Written by: FetchMSIIdentitiesInfo
+	MSIManagedIdentities ServiceProviderClusterMSIManagedIdentities `json:"msiManagedIdentities,omitempty"`
+
+	// DataPlaneOperatorsManagedIdentities tracks resolved ClientID/PrincipalID for
+	// the Azure User Assigned Managed Identities associated with the cluster's data
+	// plane operators, plus when Azure should next be re-queried for that info.
+	// A cluster's data plane operator is a Kubernetes operator associated with the
+	// cluster that runs in the cluster's data plane.
+	// For example, the Cluster's CustomerProperties.Platform.OperatorsAuthentication.UserAssignedIdentities.DataPlaneOperators map
+	// contains the set of required data plane operators associated with a Cluster.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	DataPlaneOperatorsManagedIdentities ServiceProviderClusterDataPlaneOperatorsManagedIdentities `json:"dataPlaneOperatorsManagedIdentities,omitempty"`
+
+	// KeyRotationBackupFingerprint identifies the latest successful on-demand
+	// key-rotation backup and prevents duplicate backups for the active key.
+	// It is persisted before the corresponding ApplyDesire is deleted so a crash
+	// cannot lose the record. Empty means no backup has completed.
+	// Written by: KeyRotationBackup
+	KeyRotationBackupFingerprint string `json:"keyRotationBackupFingerprint,omitempty"`
+}
+
+// ServiceProviderClusterMSIManagedIdentities holds Managed Service Identity (MSI)
+// based identity metadata resolved by FetchMSIIdentitiesInfo and consumed by ClusterIdentitySync to
+// populate HCPOpenShiftCluster.Identity.UserAssignedIdentities.
+type ServiceProviderClusterMSIManagedIdentities struct {
+	// ControlPlaneOperatorsIdentities is a map containing resolved ClientID/PrincipalID
+	// for Managed Service Identity (MSI) based Azure User-Assigned Managed Identities
+	// used by the cluster's control plane operators. The key is the fully lowercased
+	// Azure Resource ID of the identity. Which operators reference each identity is
+	// tracked on Cluster.CustomerProperties, not here. Multiple operators may share
+	// one identity entry.
+	// Written by: FetchMSIIdentitiesInfo
+	ControlPlaneOperatorsIdentities map[string]*ServiceProviderClusterControlPlaneOperatorIdentity `json:"controlPlaneOperatorsIdentities,omitempty"`
+	// ServiceManagedIdentity holds resolved ClientID/PrincipalID for the cluster's
+	// service managed identity.
+	// Written by: FetchMSIIdentitiesInfo
+	ServiceManagedIdentity *ServiceProviderClusterServiceManagedIdentity `json:"serviceManagedIdentity,omitempty"`
+}
+
+// ServiceProviderClusterControlPlaneOperatorIdentity is the resolved metadata for a
+// single Managed Service Identity (MSI) based Azure User-Assigned Managed Identity
+// used by one or more control plane operators.
+// Which operators reference this identity is tracked on
+// Cluster.CustomerProperties.Platform.OperatorsAuthentication.UserAssignedIdentities.ControlPlaneOperators.
+type ServiceProviderClusterControlPlaneOperatorIdentity struct {
+	// ResourceID is the Azure Resource ID of the Azure User Assigned Managed Identity.
+	// Its value comes from the Cluster's CustomerProperties.
+	// The ControlPlaneOperatorsIdentities map key is the fully lowercased form
+	// of this ID used for lookups.
+	ResourceID *azcorearm.ResourceID `json:"resourceId,omitempty"`
+	// ClientID is the Client ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// Fetched from Azure and written here by the FetchMSIIdentitiesInfo.
+	// It may be nil or empty.
+	ClientID *string `json:"clientId,omitempty"`
+	// PrincipalID is the Principal ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// Fetched from Azure and written here by the FetchMSIIdentitiesInfo.
+	// It may be nil or empty.
+	PrincipalID *string `json:"principalId,omitempty"`
+}
+
+// ServiceProviderClusterServiceManagedIdentity is the resolved metadata for the
+// cluster's service managed identity.
+type ServiceProviderClusterServiceManagedIdentity struct {
+	// ResourceID is the Azure Resource ID of the Azure User Assigned Managed Identity that is associated to the cluster's Service Managed Identity.
+	// Its value comes from the Cluster's CustomerProperties.
+	ResourceID *azcorearm.ResourceID `json:"resourceId,omitempty"`
+	// ClientID is the Client ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// Fetched from Azure and written here by the FetchMSIIdentitiesInfo.
+	// It may be nil or empty.
+	ClientID *string `json:"clientId,omitempty"`
+	// PrincipalID is the Principal ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// Fetched from Azure and written here by the FetchMSIIdentitiesInfo.
+	// It may be nil or empty.
+	PrincipalID *string `json:"principalId,omitempty"`
+}
+
+// ServiceProviderClusterDataPlaneOperatorsManagedIdentities holds the resolved
+// managed-identity metadata for all data plane operators on a cluster.
+type ServiceProviderClusterDataPlaneOperatorsManagedIdentities struct {
+	// Identities is a map containing resolved ClientID/PrincipalID for the Azure
+	// User Assigned Managed Identities associated with the cluster's data plane
+	// operators. The key is the fully lowercased Azure Resource ID of the
+	// identity. Which operators reference each identity is tracked on
+	// Cluster.CustomerProperties, not here. Multiple operators may share one
+	// identity entry.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	Identities map[string]*ServiceProviderClusterDataPlaneOperatorManagedIdentity `json:"identities,omitempty"`
+}
+
+// ServiceProviderClusterDataPlaneOperatorManagedIdentity contains resolved
+// ClientID/PrincipalID for an Azure User Assigned Managed Identity used by one
+// or more of a cluster's data plane operators.
+// A cluster's data plane operator is a customer operator associated with the cluster that runs in the cluster's data plane.
+// Which operators reference this identity is tracked on
+// Cluster.CustomerProperties.Platform.OperatorsAuthentication.UserAssignedIdentities.DataPlaneOperators.
+type ServiceProviderClusterDataPlaneOperatorManagedIdentity struct {
+	// ResourceID is the Azure Resource ID of the Azure User Assigned Managed Identity.
+	// This field is an input: its value is mirrored from the Cluster's CustomerProperties
+	// (Platform.OperatorsAuthentication.UserAssignedIdentities.DataPlaneOperators) into this status.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	ResourceID *azcorearm.ResourceID `json:"resourceID,omitempty"`
+	// ClientID is the Client ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// This field is an output: it is fetched from Azure and written here by the controller.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	ClientID *string `json:"clientId,omitempty"`
+	// PrincipalID is the Principal ID of the Azure User Assigned Managed Identity represented by ResourceID.
+	// This field is an output: it is fetched from Azure and written here by the controller.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	PrincipalID *string `json:"principalId,omitempty"`
+	// RetrievalError, when non-nil, is the error (truncated to the first 1024 characters) from the
+	// most recent attempt to retrieve this identity's metadata from Azure. When set, ClientID and
+	// PrincipalID are nil because the last retrieval attempt failed - either the identity was not
+	// found in Azure or the Get call returned an error - and any previously resolved values are no
+	// longer trustworthy. It is nil when the last retrieval succeeded.
+	// This field is an output: it is written here by the controller.
+	// Written by: FetchDataPlaneOperatorsManagedIdentitiesInfoController
+	RetrievalError *string `json:"retrievalError,omitempty"`
 }
 
 // AzureResources groups the Azure resource references associated with a cluster.
 type AzureResources struct {
 	// DenyAssignments tracks the deny assignments applied to the cluster's resources.
-	DenyAssignments AzureMultiReference `json:"denyAssignments,omitempty"`
+	DenyAssignments DenyAssignmentReferences `json:"denyAssignments,omitempty"`
 	// ManagedResourceGroup tracks the managed resource group for the cluster.
+	// Written by: EnsureManagedResourceGroup
 	ManagedResourceGroup AzureReference `json:"managedResourceGroup,omitempty"`
+	// RoleAssignments tracks the role assignments created on the managed resource group
+	// for the cluster's control-plane and data-plane operator identities and its service
+	// managed identity.
+	// Written by: IdentityRoleAssignments
+	RoleAssignments AzureMultiReference `json:"roleAssignments,omitempty"`
 }
 
 // AzureMultiReference tracks a set of Azure resources through their creation lifecycle.
@@ -251,14 +423,6 @@ type AzureMultiReference struct {
 	PendingAzureResources []*azcorearm.ResourceID `json:"pendingAzureResources,omitempty"`
 	// AzureResources contains resource IDs that have been confirmed to exist in Azure.
 	AzureResources []*azcorearm.ResourceID `json:"azureResources,omitempty"`
-	// EarliestRecheckTime is the earliest time at which the controller should
-	// re-check the pending resources. Nil means recheck immediately.
-	// This allows for controllers to avoid repeatedly hitting an Azure API to recheck that the desired state is true.
-	// Controllers should set this field with substantial jitter: without another concern, jitter of 50% is considered normal
-	// so that any storms are quickly dissipated.
-	// Additionally, long recheck times are recommended for resources outside of their active phases. Order of at least
-	// six hours is, with durations up to 24 hours considered normal.
-	EarliestRecheckTime *metav1.Time `json:"earliestRecheckTime,omitempty"`
 }
 
 // AzureReference tracks a single Azure resource through its creation lifecycle.
@@ -270,6 +434,16 @@ type AzureReference struct {
 	PendingAzureResource *azcorearm.ResourceID `json:"pendingAzureResource,omitempty"`
 	// AzureResource is the resource ID that has been confirmed to exist in Azure.
 	AzureResource *azcorearm.ResourceID `json:"azureResource,omitempty"`
+}
+
+type DenyAssignmentReferences struct {
+	// PendingAzureResources contains resource IDs that have been requested but
+	// not yet confirmed to exist in Azure.
+	// Written by: ClusterDenyAssignment
+	PendingAzureResources []DenyAssignmentReference `json:"pendingDenyAssignments,omitempty"`
+	// AzureResources contains resource IDs that have been confirmed to exist in Azure.
+	// Written by: ClusterDenyAssignment
+	AzureResources []DenyAssignmentReference `json:"denyAssignments,omitempty"`
 	// EarliestRecheckTime is the earliest time at which the controller should
 	// re-check the pending resources. Nil means recheck immediately.
 	// This allows for controllers to avoid repeatedly hitting an Azure API to recheck that the desired state is true.
@@ -277,7 +451,21 @@ type AzureReference struct {
 	// so that any storms are quickly dissipated.
 	// Additionally, long recheck times are recommended for resources outside of their active phases. Order of at least
 	// six hours is, with durations up to 24 hours considered normal.
+	// Written by: ClusterDenyAssignment
 	EarliestRecheckTime *metav1.Time `json:"earliestRecheckTime,omitempty"`
+}
+
+// DenyAssignmentReference identifies a single Azure deny assignment.
+// +k8s:deepcopy-gen=true
+type DenyAssignmentReference struct {
+	// DenyAssignmentType identifies the category of deny assignment (e.g. "resources-deny-assignment").
+	// Used as a suffix when generating the deterministic deny assignment UUID.
+	// Written by: ClusterDenyAssignment
+	DenyAssignmentType string `json:"denyAssignmentType"`
+	// DenyAssignmentResourceID is the full Azure resource ID of the deny assignment,
+	// e.g. "/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Authorization/denyAssignments/{uuid}".
+	// Written by: ClusterDenyAssignment
+	DenyAssignmentResourceID *azcorearm.ResourceID `json:"denyAssignmentResourceID"`
 }
 
 // ServiceProviderClusterStatusVersion contains the actual version information.

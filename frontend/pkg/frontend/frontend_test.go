@@ -68,7 +68,6 @@ func newTestSubscription(subscriptionID string, state coreapi.SubscriptionState,
 			ResourceID:   resourceID,
 			PartitionKey: strings.ToLower(resourceID.SubscriptionID),
 		},
-		ResourceID:       resourceID,
 		State:            state,
 		RegistrationDate: metadataapi.Ptr(time.Now().String()),
 		Properties:       props,
@@ -80,6 +79,7 @@ func TestOperationsList(t *testing.T) {
 	// https://github.com/cloud-and-ai-microsoft/resource-provider-contract/blob/master/v1.0/proxy-api-reference.md#required-operations
 	requiredOperations := sets.New[string](
 		path.Join(coreapi.ProviderNamespace, "register", coreapi.NamespaceOperationAction),
+		path.Join(coreapi.ProviderNamespace, "unregister", coreapi.NamespaceOperationAction), // undocumented
 	)
 
 	reg := prometheus.NewRegistry()
@@ -233,7 +233,7 @@ func TestSubscriptionsPUT(t *testing.T) {
 			name:    "PUT Subscription - Doc does not exist",
 			urlPath: coreapitesting.TestSubscriptionResourceID,
 			subscription: &coreapi.Subscription{
-				ResourceID:       metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID)),
+				CosmosMetadata:   coreapi.CosmosMetadata{ResourceID: metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID))},
 				State:            coreapi.SubscriptionStateRegistered,
 				RegistrationDate: metadataapi.Ptr(time.Now().String()),
 				Properties: &coreapi.SubscriptionProperties{
@@ -259,7 +259,7 @@ func TestSubscriptionsPUT(t *testing.T) {
 			name:    "PUT Subscription - Update with no changes",
 			urlPath: coreapitesting.TestSubscriptionResourceID,
 			subscription: &coreapi.Subscription{
-				ResourceID:       metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID)),
+				CosmosMetadata:   coreapi.CosmosMetadata{ResourceID: metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID))},
 				State:            coreapi.SubscriptionStateRegistered,
 				RegistrationDate: metadataapi.Ptr(time.Now().String()),
 				Properties:       nil,
@@ -272,7 +272,7 @@ func TestSubscriptionsPUT(t *testing.T) {
 			name:    "PUT Subscription - Update registered features",
 			urlPath: coreapitesting.TestSubscriptionResourceID,
 			subscription: &coreapi.Subscription{
-				ResourceID:       metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID)),
+				CosmosMetadata:   coreapi.CosmosMetadata{ResourceID: metadataapi.Must(coreapi.ToSubscriptionResourceID(coreapitesting.TestSubscriptionID))},
 				State:            coreapi.SubscriptionStateRegistered,
 				RegistrationDate: metadataapi.Ptr(time.Now().String()),
 				Properties: &coreapi.SubscriptionProperties{

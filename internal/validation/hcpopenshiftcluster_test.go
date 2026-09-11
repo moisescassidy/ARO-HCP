@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blang/semver/v4"
+
 	"k8s.io/apimachinery/pkg/api/operation"
 
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
@@ -454,14 +456,16 @@ func TestClusterValidate(t *testing.T) {
 			expectErrors: []utils.ExpectedError{},
 		},
 		{
-			name: "Version must be at least 4.19 with experimental flag",
+			name: "Version must be at least 4.20 with experimental flag",
 			resource: func() *coreapi.HCPOpenShiftCluster {
 				r := coreapitesting.MinimumValidClusterTestCase()
 				r.CustomerProperties.Version.ID = "4.19"
 				return r
 			}(),
-			opOptions:    testFeatureOptions(metadataapi.FeatureExperimentalReleaseFeatures),
-			expectErrors: []utils.ExpectedError{},
+			opOptions: testFeatureOptions(metadataapi.FeatureExperimentalReleaseFeatures),
+			expectErrors: []utils.ExpectedError{
+				{Message: "must be at least 4.20", FieldPath: "customerProperties.version.id"},
+			},
 		},
 		{
 			name: "ChannelGroup nightly is rejected without experimental flag",
@@ -478,10 +482,32 @@ func TestClusterValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "ChannelGroup nightly is allowed with experimental flag",
+			// A bare "<major>.<minor>" with no exact pin is what the object looks
+			// like post-mutation when the customer did not supply a full version.
+			name: "ChannelGroup nightly without a full version is rejected with experimental flag",
 			resource: func() *coreapi.HCPOpenShiftCluster {
 				r := coreapitesting.MinimumValidClusterTestCase()
 				r.CustomerProperties.Version.ChannelGroup = "nightly"
+				return r
+			}(),
+			opOptions: testFeatureOptions(metadataapi.FeatureExperimentalReleaseFeatures),
+			expectErrors: []utils.ExpectedError{
+				{
+					Message:   "must be specified as MAJOR.MINOR.PATCH (optionally with a pre-release, e.g. a nightly build suffix) when channelGroup is \"nightly\"",
+					FieldPath: "customerProperties.version.id",
+				},
+			},
+		},
+		{
+			// Post-mutation shape for a full nightly version.id: version.id is
+			// reduced to its release line and the exact build is pinned on
+			// ExperimentalFeatures. The validator maps the pin back and accepts it.
+			name: "ChannelGroup nightly with a mapped exact version is allowed with experimental flag",
+			resource: func() *coreapi.HCPOpenShiftCluster {
+				r := coreapitesting.MinimumValidClusterTestCase()
+				r.CustomerProperties.Version.ChannelGroup = "nightly"
+				exact := semver.MustParse("4.20.0-0.nightly-2026-08-05-123456")
+				r.ServiceProviderProperties.ExperimentalFeatures.ControlPlaneExactVersion = &exact
 				return r
 			}(),
 			opOptions:    testFeatureOptions(metadataapi.FeatureExperimentalReleaseFeatures),

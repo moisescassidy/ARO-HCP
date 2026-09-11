@@ -1,5 +1,5 @@
 apiVersion: v2
-appVersion: 2.11.5
+appVersion: 2.11.7
 description: A Helm chart for multicluster-engine - CRDs
 keywords:
 - mce
@@ -7,6 +7,6 @@ keywords:
 - multiclusterengine
 name: multicluster-engine-crds
 sources:
-- quay.io/redhat-user-workloads/crt-redhat-acm-tenant/mce-operator-bundle-mce-211@sha256:a4d84732b77b079ec312940574b952f2b487990dc2c9f033a259a57e46eba181
+- quay.io/redhat-user-workloads/crt-redhat-acm-tenant/mce-operator-bundle-mce-211@sha256:7b6b654f24d92506b555b209df7d57e49db4322ac2c1e8db9ef9c1325fdaedeb
 type: application
-version: 2.11.5
+version: 2.11.7

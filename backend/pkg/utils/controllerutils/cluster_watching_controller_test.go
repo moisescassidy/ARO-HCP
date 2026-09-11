@@ -28,12 +28,25 @@ import (
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 
 	"github.com/Azure/ARO-HCP/internal/api/coreapi"
+	"github.com/Azure/ARO-HCP/internal/api/kubeapplierapi"
 	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 	controllerutil "github.com/Azure/ARO-HCP/internal/controllerutils"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstoragetesting/corecosmosstoragetesting"
 	"github.com/Azure/ARO-HCP/internal/database/listers/corelisters"
 	"github.com/Azure/ARO-HCP/internal/utils"
 )
+
+type capturingNotifier struct {
+	addFunc    func(any)
+	updateFunc func(any, any)
+}
+
+func (n *capturingNotifier) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, opts cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	f := handler.(cache.ResourceEventHandlerFuncs)
+	n.addFunc = f.AddFunc
+	n.updateFunc = f.UpdateFunc
+	return nil, nil
+}
 
 type mockClusterSyncer struct {
 	syncOnceFunc func(ctx context.Context, key HCPClusterKey) error
@@ -80,10 +93,13 @@ func TestClusterWatchingControllerSyncHasLoggerContextValues(t *testing.T) {
 	resourceGroup := "test-rg"
 	clusterName := "test-cluster"
 
-	var capturedCtx context.Context
+	capturedCtxCh := make(chan context.Context, 1)
 	mockSyncer := &mockClusterSyncer{
 		syncOnceFunc: func(ctx context.Context, key HCPClusterKey) error {
-			capturedCtx = ctx
+			select {
+			case capturedCtxCh <- ctx:
+			default:
+			}
 			return nil
 		},
 	}
@@ -97,24 +113,37 @@ func TestClusterWatchingControllerSyncHasLoggerContextValues(t *testing.T) {
 		clusterLister:     newFakeClusterLister(subscriptionID, resourceGroup, clusterName),
 	}
 	gwc := newGenericWatchingController("test-controller", coreapi.ClusterResourceType, inner)
-	gwc.queue.Add(HCPClusterKey{
-		SubscriptionID:    subscriptionID,
-		ResourceGroupName: resourceGroup,
-		HCPClusterName:    clusterName,
-	})
+
+	notifier := &capturingNotifier{}
+	require.NoError(t, gwc.QueueForInformers(time.Minute, notifier))
+
+	clusterResourceID := metadataapi.Must(coreapi.ToClusterResourceID(subscriptionID, resourceGroup, clusterName))
+	notifier.addFunc(&coreapi.CosmosMetadata{ResourceID: clusterResourceID})
 
 	var logOutput strings.Builder
 	logger := funcr.New(func(prefix, args string) {
 		logOutput.WriteString(prefix)
 		logOutput.WriteString(args)
 	}, funcr.Options{})
-	ctx := utils.ContextWithLogger(context.Background(), logger)
 
-	gwc.processNextWorkItem(ctx)
+	ctx, cancel := context.WithCancel(utils.ContextWithLogger(context.Background(), logger))
 
-	require.NotNil(t, capturedCtx, "syncer should have been called")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gwc.Run(ctx, 1)
+	}()
 
-	// Log a message using the captured logger to verify its values
+	var capturedCtx context.Context
+	select {
+	case capturedCtx = <-capturedCtxCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncer should have been called")
+	}
+
+	cancel()
+	<-done
+
 	capturedLogger := utils.LoggerFromContext(capturedCtx)
 	capturedLogger.Info("test")
 
@@ -124,4 +153,76 @@ func TestClusterWatchingControllerSyncHasLoggerContextValues(t *testing.T) {
 	require.Contains(t, output, ` "resource_name"="test-cluster" `, "logger should contain cluster name")
 	require.Contains(t, output, `"hcp_cluster_name"="/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/test-rg/providers/microsoft.redhatopenshift/hcpopenshiftclusters/test-cluster"`)
 
+}
+
+// TestClusterWatchingControllerApplyDesireEnqueue verifies the cluster-scoped
+// (maxDepth 1) ApplyDesire wiring added for the Degraded aggregator: a
+// cluster-scoped ApplyDesire event enqueues its parent cluster, while a
+// node-pool-nested ApplyDesire (two hops from the cluster) does not.
+func TestClusterWatchingControllerApplyDesireEnqueue(t *testing.T) {
+	subscriptionID := "00000000-0000-0000-0000-000000000000"
+	resourceGroup := "test-rg"
+	clusterName := "test-cluster"
+
+	syncedKeys := make(chan HCPClusterKey, 4)
+	mockSyncer := &mockClusterSyncer{
+		syncOnceFunc: func(ctx context.Context, key HCPClusterKey) error {
+			select {
+			case syncedKeys <- key:
+			default:
+			}
+			return nil
+		},
+	}
+
+	inner := &clusterWatchingController{
+		name:              "test-controller",
+		resourcesDBClient: corecosmosstoragetesting.NewMockResourcesDBClient(),
+		syncer:            mockSyncer,
+		clusterLister:     newFakeClusterLister(subscriptionID, resourceGroup, clusterName),
+	}
+	gwc := newGenericWatchingController("test-controller", coreapi.ClusterResourceType, inner)
+
+	notifier := &capturingNotifier{}
+	// Mirror the production ApplyDesire wiring: cluster-scoped only (maxDepth 1).
+	require.NoError(t, gwc.QueueForInformersWithMaxDepth(time.Minute, 1, notifier))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gwc.Run(ctx, 1)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// A cluster-scoped ApplyDesire sits one hop below the cluster, so maxDepth 1
+	// reaches the cluster and enqueues it.
+	clusterScopedID := metadataapi.Must(azcorearm.ParseResourceID(
+		kubeapplierapi.ToClusterScopedApplyDesireResourceIDString(subscriptionID, resourceGroup, clusterName, "cfg")))
+	notifier.addFunc(&coreapi.CosmosMetadata{ResourceID: clusterScopedID})
+
+	select {
+	case key := <-syncedKeys:
+		require.Equal(t, subscriptionID, key.SubscriptionID)
+		require.Equal(t, resourceGroup, key.ResourceGroupName)
+		require.Equal(t, clusterName, key.HCPClusterName)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cluster-scoped ApplyDesire event should have enqueued the cluster")
+	}
+
+	// A node-pool-nested ApplyDesire is two hops from the cluster, beyond
+	// maxDepth 1, so it must NOT enqueue the cluster.
+	nodePoolNestedID := metadataapi.Must(azcorearm.ParseResourceID(
+		kubeapplierapi.ToNodePoolScopedApplyDesireResourceIDString(subscriptionID, resourceGroup, clusterName, "np", "cfg")))
+	notifier.addFunc(&coreapi.CosmosMetadata{ResourceID: nodePoolNestedID})
+
+	select {
+	case key := <-syncedKeys:
+		t.Fatalf("node-pool-nested ApplyDesire must not enqueue the cluster, but synced %+v", key)
+	case <-time.After(500 * time.Millisecond):
+		// expected: no enqueue for node-pool-nested desires
+	}
 }

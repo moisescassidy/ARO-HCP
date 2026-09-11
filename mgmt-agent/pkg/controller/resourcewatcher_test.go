@@ -37,6 +37,7 @@ func TestMatchesGroupSuffix(t *testing.T) {
 		{"capi-provider.agent-install.openshift.io", true},
 		{"multicluster.openshift.io", true},
 		{"multitenancy.acn.azure.com", true},
+		{"velero.io", true},
 		{"", false},
 		{"apps", false},
 		{"openshift.io", false},
@@ -132,6 +133,26 @@ func TestDiscoverGVRs(t *testing.T) {
 	for i, gvr := range gvrs {
 		if gvr != expected[i] {
 			t.Errorf("gvrs[%d] = %v, want %v", i, gvr, expected[i])
+		}
+	}
+}
+
+func TestWatchedBuiltinGVRs(t *testing.T) {
+	// These built-in (non-CRD) resources are not covered by watchedGroupSuffixes,
+	// so they must be listed explicitly in watchedBuiltinGVRs to be snapshotted.
+	required := []schema.GroupVersionResource{
+		{Group: "", Version: "v1", Resource: "namespaces"},
+		{Group: "", Version: "v1", Resource: "nodes"},
+		{Group: "apps", Version: "v1", Resource: "deployments"},
+		{Group: "apps", Version: "v1", Resource: "daemonsets"},
+		{Group: "apps", Version: "v1", Resource: "statefulsets"},
+		{Group: "apps", Version: "v1", Resource: "replicasets"},
+	}
+
+	have := sets.New[schema.GroupVersionResource](watchedBuiltinGVRs...)
+	for _, want := range required {
+		if !have.Has(want) {
+			t.Errorf("watchedBuiltinGVRs is missing %v", want)
 		}
 	}
 }

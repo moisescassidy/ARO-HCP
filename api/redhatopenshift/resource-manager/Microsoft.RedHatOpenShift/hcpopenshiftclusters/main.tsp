@@ -1,4 +1,5 @@
 import "@typespec/versioning";
+import "@azure-tools/typespec-azure-core";
 import "@azure-tools/typespec-azure-resource-manager";
 
 import "./hcpCluster.tsp";
@@ -34,4 +35,9 @@ enum Versions {
   /** 2026-09-01-preview version */
   @armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v6)
   v2026_09_01_preview: "2026-09-01-preview",
+
+  /** 2026-10-01-preview version */
+  @Azure.Core.previewVersion
+  @armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v6)
+  v2026_10_01_preview: "2026-10-01-preview",
 }

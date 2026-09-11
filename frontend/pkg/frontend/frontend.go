@@ -52,12 +52,12 @@ import (
 	"github.com/Azure/ARO-HCP/internal/azureapi/v20251223preview"
 	"github.com/Azure/ARO-HCP/internal/azureapi/v20260630preview"
 	"github.com/Azure/ARO-HCP/internal/azureapi/v20260901preview"
+	"github.com/Azure/ARO-HCP/internal/azureapi/v20261001preview"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/corecosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
 	"github.com/Azure/ARO-HCP/internal/ocm"
 	"github.com/Azure/ARO-HCP/internal/systemadmincredential"
 	"github.com/Azure/ARO-HCP/internal/utils"
-	"github.com/Azure/ARO-HCP/internal/utils/armhelpers"
 	"github.com/Azure/ARO-HCP/internal/validation"
 )
 
@@ -98,6 +98,7 @@ func NewFrontend(
 	metadataapi.Must[any](nil, v20251223preview.RegisterVersion(apiRegistry))
 	metadataapi.Must[any](nil, v20260630preview.RegisterVersion(apiRegistry))
 	metadataapi.Must[any](nil, v20260901preview.RegisterVersion(apiRegistry))
+	metadataapi.Must[any](nil, v20261001preview.RegisterVersion(apiRegistry))
 
 	f := &Frontend{
 		clock:                utilsclock.RealClock{},
@@ -584,11 +585,10 @@ func (f *Frontend) ArmSubscriptionPut(writer http.ResponseWriter, request *http.
 	if err != nil {
 		return coreapi.NewInvalidRequestContentError(err)
 	}
-	requestSubscription.CosmosMetadata.ResourceID, err = coreapi.ToSubscriptionResourceID(subscriptionID)
+	requestSubscription.ResourceID, err = coreapi.ToSubscriptionResourceID(subscriptionID)
 	if err != nil {
 		return utils.TrackError(err)
 	}
-	requestSubscription.ResourceID = requestSubscription.CosmosMetadata.ResourceID
 	requestSubscription.SetPartitionKey(subscriptionID)
 
 	validationErrs := validation.ValidateSubscriptionCreate(ctx, &requestSubscription)
@@ -1077,7 +1077,7 @@ func (f *Frontend) OperationResult(writer http.ResponseWriter, request *http.Req
 			return utils.TrackError(err)
 		}
 
-	case armhelpers.ResourceTypeEqual(operation.ExternalID.ResourceType, coreapi.ClusterResourceType):
+	case metadataapi.ResourceTypeEqual(operation.ExternalID.ResourceType, coreapi.ClusterResourceType):
 		resultingInternalCluster, err := f.getInternalClusterFromStorage(ctx, operation.ExternalID)
 		if err != nil {
 			return utils.TrackError(err)

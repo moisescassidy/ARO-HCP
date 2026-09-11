@@ -140,7 +140,31 @@ func (s *deleteOrphanedStep) Discover(ctx context.Context) ([]runner.Target, err
 }
 
 func (s *deleteOrphanedStep) Delete(ctx context.Context, target runner.Target, _ bool) error {
-	_, err := s.cfg.RoleAssignmentsClient.DeleteByID(ctx, target.ID, nil)
+	response, err := s.cfg.RoleAssignmentsClient.GetByID(ctx, target.ID, nil)
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("failed to re-read role assignment %q: %w", target.ID, err)
+	}
+	if response.Properties == nil ||
+		response.Properties.PrincipalID == nil ||
+		normalizeID(*response.Properties.PrincipalID) == "" {
+		return fmt.Errorf("refusing to delete role assignment %q without a principal ID", target.ID)
+	}
+
+	principalID := normalizeID(*response.Properties.PrincipalID)
+	activePrincipalLookup := newGraphActivePrincipalLookup(s.cfg.GraphClient)
+	active, err := activePrincipalLookup(ctx, principalID)
+	if err != nil {
+		return fmt.Errorf("failed revalidating principal %q for role assignment %q: %w", principalID, target.ID, err)
+	}
+	if active {
+		return fmt.Errorf("%w: principal %q exists in the active directory", runner.ErrTargetRetained, principalID)
+	}
+
+	_, err = s.cfg.RoleAssignmentsClient.DeleteByID(ctx, target.ID, nil)
 	if err != nil {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
@@ -152,9 +176,9 @@ func (s *deleteOrphanedStep) Delete(ctx context.Context, target runner.Target, _
 }
 
 // SAFETY CONTRACT:
-// This tool assumes that "principal not returned by Graph" means "safe to delete".
-// To prevent accidental deletion when run with insufficient permissions,
-// an explicit Graph preflight check is enforced and cannot be bypassed.
+// A role assignment is deletable only when its principal is absent from the
+// active directory at discovery and again immediately before deletion. An
+// explicit Graph visibility preflight is also enforced and cannot be bypassed.
 func discoverOrphanedRoleAssignments(
 	ctx context.Context,
 	roleAssignmentsClient *armauthorization.RoleAssignmentsClient,
@@ -191,26 +215,18 @@ func discoverOrphanedRoleAssignments(
 		return nil, err
 	}
 
-	// 2-4) Resolve all unique principal IDs via Graph directoryObjects/getByIds.
-	resolvedPrincipalIDs, err := resolvePrincipalIDsWithGraphGetByIDs(ctx, graphClient, assignments, logger, skipReporter)
+	// 2) Collect all unique principal IDs from the ARM assignments.
+	principalIDs := collectPrincipalIDs(assignments, logger, skipReporter)
+
+	// 3) Resolve active principals via Graph directoryObjects/getByIds.
+	resolvedPrincipalIDs, err := resolvePrincipalIDsWithGraphGetByIDs(ctx, graphClient, principalIDs, logger, skipReporter)
 	if err != nil {
 		return nil, fmt.Errorf("failed resolving role assignment principals with Microsoft Graph getByIds: %w", err)
 	}
 
-	// 5) Keep assignment iff principalId is not in resolved set.
-	candidateIDs := sets.New[string]()
-	candidates := make([]roleAssignmentRecord, 0, len(assignments))
-	for _, assignment := range assignments {
-		if _, resolved := resolvedPrincipalIDs[normalizeID(assignment.PrincipalID)]; resolved {
-			continue
-		}
-		if candidateIDs.Has(assignment.ID) {
-			continue
-		}
-		candidateIDs.Insert(assignment.ID)
-		candidates = append(candidates, assignment)
-	}
-
+	// 4) Keep an assignment only when its principal was absent from the active
+	// directory. Missing principal IDs are retained rather than guessed.
+	candidates := selectOrphanedRoleAssignments(assignments, resolvedPrincipalIDs)
 	targets := make([]runner.Target, 0, len(candidates))
 	for _, candidate := range candidates {
 		targets = append(targets, candidate.ToTarget())
@@ -359,13 +375,11 @@ func (r roleAssignmentRecord) ToTarget() runner.Target {
 	}
 }
 
-func resolvePrincipalIDsWithGraphGetByIDs(
-	ctx context.Context,
-	graphClient *msgraphsdk.GraphServiceClient,
+func collectPrincipalIDs(
 	assignments []roleAssignmentRecord,
 	logger logr.Logger,
 	skipReporter *common.DiscoverySkipReporter,
-) (sets.Set[string], error) {
+) sets.Set[string] {
 	uniquePrincipalIDs := sets.New[string]()
 	for _, assignment := range assignments {
 		normalizedPrincipalID := normalizeID(assignment.PrincipalID)
@@ -379,12 +393,22 @@ func resolvePrincipalIDsWithGraphGetByIDs(
 		}
 		uniquePrincipalIDs.Insert(normalizedPrincipalID)
 	}
-	if uniquePrincipalIDs.Len() == 0 {
+	return uniquePrincipalIDs
+}
+
+func resolvePrincipalIDsWithGraphGetByIDs(
+	ctx context.Context,
+	graphClient *msgraphsdk.GraphServiceClient,
+	principalIDs sets.Set[string],
+	logger logr.Logger,
+	skipReporter *common.DiscoverySkipReporter,
+) (sets.Set[string], error) {
+	if principalIDs.Len() == 0 {
 		return sets.New[string](), nil
 	}
 
 	resolvedPrincipalIDs := sets.New[string]()
-	ids := sets.List(uniquePrincipalIDs)
+	ids := sets.List(principalIDs)
 	for start := 0; start < len(ids); start += graphGetByIDsBatchSize {
 		end := min(start+graphGetByIDsBatchSize, len(ids))
 		body := graphdirectoryobjects.NewGetByIdsPostRequestBody()
@@ -418,6 +442,61 @@ func resolvePrincipalIDsWithGraphGetByIDs(
 	}
 
 	return resolvedPrincipalIDs, nil
+}
+
+type activePrincipalLookup func(context.Context, string) (bool, error)
+
+func newGraphActivePrincipalLookup(graphClient *msgraphsdk.GraphServiceClient) activePrincipalLookup {
+	return func(ctx context.Context, principalID string) (bool, error) {
+		body := graphdirectoryobjects.NewGetByIdsPostRequestBody()
+		body.SetIds([]string{principalID})
+
+		response, err := graphClient.DirectoryObjects().GetByIds().PostAsGetByIdsPostResponse(ctx, body, nil)
+		if err != nil {
+			return false, err
+		}
+		if response == nil {
+			return false, fmt.Errorf("active principal lookup for %q returned an empty response", principalID)
+		}
+		if len(response.GetValue()) == 0 {
+			return false, nil
+		}
+		if len(response.GetValue()) != 1 ||
+			response.GetValue()[0] == nil ||
+			response.GetValue()[0].GetId() == nil {
+			return false, fmt.Errorf("active principal lookup for %q returned an invalid response", principalID)
+		}
+		resolvedID := normalizeID(*response.GetValue()[0].GetId())
+		if resolvedID == "" || resolvedID != normalizeID(principalID) {
+			return false, fmt.Errorf(
+				"active principal lookup for %q returned unexpected ID %q",
+				principalID,
+				resolvedID,
+			)
+		}
+		return true, nil
+	}
+}
+
+func selectOrphanedRoleAssignments(
+	assignments []roleAssignmentRecord,
+	resolvedPrincipalIDs sets.Set[string],
+) []roleAssignmentRecord {
+	candidateIDs := sets.New[string]()
+	candidates := make([]roleAssignmentRecord, 0, len(assignments))
+	for _, assignment := range assignments {
+		principalID := normalizeID(assignment.PrincipalID)
+		if principalID == "" || resolvedPrincipalIDs.Has(principalID) {
+			continue
+		}
+		normalizedAssignmentID := normalizeID(assignment.ID)
+		if candidateIDs.Has(normalizedAssignmentID) {
+			continue
+		}
+		candidateIDs.Insert(normalizedAssignmentID)
+		candidates = append(candidates, assignment)
+	}
+	return candidates
 }
 
 func escapeODataString(raw string) string {

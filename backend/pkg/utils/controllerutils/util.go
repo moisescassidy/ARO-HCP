@@ -34,7 +34,6 @@ import (
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/corecosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
 	"github.com/Azure/ARO-HCP/internal/utils"
-	"github.com/Azure/ARO-HCP/internal/utils/armhelpers"
 )
 
 type Controller interface {
@@ -303,15 +302,15 @@ func controllerCRUDForParent(resourcesDBClient corecosmosstorage.ResourcesDBClie
 	hcp := resourcesDBClient.HCPClusters(subscriptionID, resourceGroupName)
 
 	switch {
-	case armhelpers.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.ClusterResourceType):
+	case metadataapi.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.ClusterResourceType):
 		return hcp.Controllers(parentResourceID.Name), nil
-	case armhelpers.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.NodePoolResourceType):
+	case metadataapi.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.NodePoolResourceType):
 		if parentResourceID.Parent == nil {
 			return nil, fmt.Errorf("node pool resource ID is missing parent cluster ID")
 		}
 		clusterName := parentResourceID.Parent.Name
 		return hcp.NodePools(clusterName).Controllers(parentResourceID.Name), nil
-	case armhelpers.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.ExternalAuthResourceType):
+	case metadataapi.ResourceTypeEqual(parentResourceID.ResourceType, coreapi.ExternalAuthResourceType):
 		if parentResourceID.Parent == nil {
 			return nil, fmt.Errorf("external auth resource ID is missing parent cluster ID")
 		}
@@ -428,4 +427,14 @@ func WriteController(ctx context.Context, controllerCRUD cosmosstorageutils.Reso
 		return fmt.Errorf("failed to replace existing controller state: %w", replaceErr)
 	}
 	return nil
+}
+
+func ClusterServiceIDForCluster(cluster *coreapi.HCPOpenShiftCluster) string {
+	if cluster.ServiceProviderProperties.PendingClusterServiceID != nil {
+		return cluster.ServiceProviderProperties.PendingClusterServiceID.ClusterID()
+	}
+	if cluster.ServiceProviderProperties.ClusterServiceID != nil {
+		return cluster.ServiceProviderProperties.ClusterServiceID.ClusterID()
+	}
+	return ""
 }

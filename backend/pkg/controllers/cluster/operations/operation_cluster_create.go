@@ -228,6 +228,11 @@ func (c *operationClusterCreate) determineOperationState(ctx context.Context, op
 	} else {
 		operationStates = append(operationStates, currState.WithSource("servingCABundle"))
 	}
+	if currState, err := c.roleAssignmentsOperationStatus(ctx, operation); err != nil {
+		errs = append(errs, utils.TrackError(err))
+	} else {
+		operationStates = append(operationStates, currState.WithSource("roleAssignments"))
+	}
 
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
@@ -252,6 +257,14 @@ func (c *operationClusterCreate) determineOperationState(ctx context.Context, op
 
 func (c *operationClusterCreate) clusterServiceCreateOperationState(ctx context.Context, operation *coreapi.Operation, cluster *coreapi.HCPOpenShiftCluster) (*operationbase.OperationState, error) {
 	logger := utils.LoggerFromContext(ctx)
+
+	// The Cluster Service resource is created asynchronously; until its ID is
+	// populated there is nothing to query, so report the operation as still
+	// provisioning rather than dereferencing a nil ClusterServiceID.
+	if cluster.ServiceProviderProperties.ClusterServiceID == nil || len(cluster.ServiceProviderProperties.ClusterServiceID.String()) == 0 {
+		return operationbase.NewOperationState(coreapi.ProvisioningStateProvisioning, "cluster service has not been successfully created"), nil
+	}
+
 	clusterServiceID := *cluster.ServiceProviderProperties.ClusterServiceID
 
 	clusterStatus, err := c.clusterServiceClient.GetClusterStatus(ctx, clusterServiceID)
@@ -293,7 +306,6 @@ func (c *operationClusterCreate) clusterOperationStatus(ctx context.Context, ope
 // minVersionsWithValidSuccessCondition maps from <major>.<micro> to the first z-stream version that includes the fix for
 // control plane validation success.
 var minVersionsWithValidSuccessCondition = map[string]semver.Version{
-	"4.19": metadataapi.Must(semver.Parse("4.19.999")),
 	"4.20": metadataapi.Must(semver.Parse("4.20.15")),
 	"4.21": metadataapi.Must(semver.Parse("4.21.1")),
 	"4.22": metadataapi.Must(semver.Parse("4.22.0")),
@@ -363,8 +375,8 @@ func (c *operationClusterCreate) hostedClusterOperationStatus(ctx context.Contex
 
 		if !anyVersionInstalled {
 			// can only check this when the success condition works, because this is unreliable otherwise
-			logger.Info("hosted cluster has no installed version", "hostedCluster.Status.ControlPlaneVersion.History", hostedCluster.Status.ControlPlaneVersion.History)
-			return operationbase.NewOperationState(coreapi.ProvisioningStateProvisioning, withDegradedSuffix("hosted cluster has no installed version", hostedCluster)), nil
+			logger.Info("hosted cluster has not completed installing", "hostedCluster.Status.ControlPlaneVersion.History", hostedCluster.Status.ControlPlaneVersion.History)
+			return operationbase.NewOperationState(coreapi.ProvisioningStateProvisioning, withDegradedSuffix("hosted cluster has not completed installing", hostedCluster)), nil
 		}
 	}
 
@@ -400,9 +412,30 @@ func (c *operationClusterCreate) servingCABundleOperationStatus(ctx context.Cont
 	return operationbase.NewOperationState(coreapi.ProvisioningStateSucceeded, ""), nil
 }
 
+// roleAssignmentsOperationStatus blocks cluster creation until the managed
+// resource group scoped role assignments for the cluster's control-plane operator,
+// data-plane operator, and service managed identity have all been confirmed present.
+// The IdentityRoleAssignments controller creates them and reflects them onto
+// ServiceProviderCluster.Status.AzureResources.RoleAssignments; creation is
+// considered complete for this source once at least one role assignment is confirmed
+// and none remain pending.
+func (c *operationClusterCreate) roleAssignmentsOperationStatus(ctx context.Context, operation *coreapi.Operation) (*operationbase.OperationState, error) {
+	serviceProviderCluster, err := c.serviceProviderClusterLister.Get(ctx, operation.ExternalID.SubscriptionID, operation.ExternalID.ResourceGroupName, operation.ExternalID.Name)
+	if cosmosstorageutils.IsNotFoundError(err) {
+		return operationbase.NewOperationState(coreapi.ProvisioningStateProvisioning, "ServiceProviderCluster not cached yet"), nil
+	}
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+	roleAssignments := serviceProviderCluster.Status.AzureResources.RoleAssignments
+	if len(roleAssignments.AzureResources) == 0 || len(roleAssignments.PendingAzureResources) != 0 {
+		return operationbase.NewOperationState(coreapi.ProvisioningStateProvisioning, "role assignments not yet confirmed"), nil
+	}
+	return operationbase.NewOperationState(coreapi.ProvisioningStateSucceeded, ""), nil
+}
+
 func (c *operationClusterCreate) shouldReconcileOperationAndResourceStatus(cluster *coreapi.HCPOpenShiftCluster) bool {
-	return cluster.ServiceProviderProperties.DeletionTimestamp == nil &&
-		cluster.ServiceProviderProperties.ClusterServiceID != nil
+	return cluster.ServiceProviderProperties.DeletionTimestamp == nil
 }
 
 // withDegradedSuffix appends the HostedCluster Degraded condition's reason and

@@ -16,63 +16,19 @@ package serverutils
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 
+	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/billingcosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/corecosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/kubeappliercosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/utils"
 )
-
-const RedactStr = "REDACTED"
-
-// ObjectMetadata provides per-document identity for the cosmosResourceSnapshots
-// Kusto table. It is emitted as a structured log field alongside the document content.
-type ObjectMetadata struct {
-	CosmosContainer string `json:"cosmosContainer"`
-	SubscriptionID  string `json:"subscriptionID"`
-	ResourceGroup   string `json:"resourceGroup"`
-	ResourceType    string `json:"resourceType"`
-	ResourceName    string `json:"resourceName"`
-	ResourceID      string `json:"resourceID"`
-}
-
-func objectMetadataForTypedDocument(container string, doc *cosmosstorageutils.TypedDocument) ObjectMetadata {
-	if doc == nil || doc.ResourceID == nil {
-		return ObjectMetadata{CosmosContainer: container}
-	}
-	return ObjectMetadata{
-		CosmosContainer: container,
-		SubscriptionID:  doc.ResourceID.SubscriptionID,
-		ResourceGroup:   doc.ResourceID.ResourceGroupName,
-		ResourceType:    doc.ResourceType,
-		ResourceName:    doc.ResourceID.Name,
-		ResourceID:      doc.ResourceID.String(),
-	}
-}
-
-// ObjectMetadataForResourceID builds ObjectMetadata from an ARM resource ID.
-func ObjectMetadataForResourceID(container string, resourceID *azcorearm.ResourceID) ObjectMetadata {
-	if resourceID == nil {
-		return ObjectMetadata{CosmosContainer: container}
-	}
-	return ObjectMetadata{
-		CosmosContainer: container,
-		SubscriptionID:  resourceID.SubscriptionID,
-		ResourceGroup:   resourceID.ResourceGroupName,
-		ResourceType:    resourceID.ResourceType.String(),
-		ResourceName:    resourceID.Name,
-		ResourceID:      resourceID.String(),
-	}
-}
 
 // DumpDataToLogger writes a structured-log entry for every document related
 // to resourceID. It covers three storage layers:
@@ -109,14 +65,14 @@ func DumpDataToLogger(
 	if err != nil {
 		return utils.TrackError(err)
 	}
-	err = redactTypedDocument(startingCosmosRecord)
+	err = cosmosstorageutils.RedactTypedDocument(startingCosmosRecord)
 	if err != nil {
 		return utils.TrackError(err)
 	}
 	logger.Info(fmt.Sprintf("dumping resourceID %v", startingCosmosRecord.ResourceID),
 		"snapshotType", "cosmos",
 		"currentResourceID", resourceIDToString(startingCosmosRecord.ResourceID),
-		"objectMetadata", objectMetadataForTypedDocument("resources", startingCosmosRecord),
+		"objectMetadata", cosmosstorageutils.ObjectMetadataForTypedDocument("resources", startingCosmosRecord),
 		"content", startingCosmosRecord,
 	)
 
@@ -127,14 +83,14 @@ func DumpDataToLogger(
 
 	errs := []error{}
 	for _, typedDocument := range allCosmosRecords.Items(ctx) {
-		if err := redactTypedDocument(typedDocument); err != nil {
+		if err := cosmosstorageutils.RedactTypedDocument(typedDocument); err != nil {
 			errs = append(errs, utils.TrackError(err))
 			continue
 		}
 		logger.Info(fmt.Sprintf("dumping resourceID %v", typedDocument.ResourceID),
 			"snapshotType", "cosmos",
 			"currentResourceID", resourceIDToString(typedDocument.ResourceID),
-			"objectMetadata", objectMetadataForTypedDocument("resources", typedDocument),
+			"objectMetadata", cosmosstorageutils.ObjectMetadataForTypedDocument("resources", typedDocument),
 			"content", typedDocument,
 		)
 	}
@@ -143,23 +99,27 @@ func DumpDataToLogger(
 	}
 
 	// dump all related operations, including the completed ones.
-	allOperationsForSubscription, err := resourcesDBClient.Operations(resourceID.SubscriptionID).List(ctx, nil)
-	if err != nil {
-		errs = append(errs, err)
-	}
-	resourceIDString := strings.ToLower(resourceID.String())
-	for _, operation := range allOperationsForSubscription.Items(ctx) {
-		currOperationTarget := strings.ToLower(operation.ExternalID.String())
-		if strings.HasPrefix(currOperationTarget, resourceIDString) {
-			logger.Info(fmt.Sprintf("dumping resourceID %v", operation.ResourceID),
-				"snapshotType", "cosmos",
-				"currentResourceID", resourceIDToString(operation.ResourceID),
-				"objectMetadata", ObjectMetadataForResourceID("operations", operation.ResourceID),
-				"content", operation,
-			)
+	operationIter := resourcesDBClient.Operations(resourceID.SubscriptionID).ListActiveOperations(
+		&corecosmosstorage.ResourcesDBClientListActiveOperationDocsOptions{
+			ExternalID:             resourceID,
+			IncludeNestedResources: true,
+			IncludeTerminal:        true,
+		})
+	for _, operation := range operationIter.Items(ctx) {
+		// An operation's own ResourceID is subscription/location-scoped, so derive the HCP
+		// cluster name from its ExternalID (the targeted cluster/node pool) when possible.
+		opLogger := logger
+		if hcpClusterName := metadataapi.ClusterNameFromResourceID(operation.ExternalID); hcpClusterName != "" {
+			opLogger = logger.WithValues(utils.LogValues{}.AddHCPClusterName(hcpClusterName)...)
 		}
+		opLogger.Info(fmt.Sprintf("dumping resourceID %v", operation.ResourceID),
+			"snapshotType", "cosmos",
+			"currentResourceID", resourceIDToString(operation.ResourceID),
+			"objectMetadata", cosmosstorageutils.ObjectMetadataForOperation(operation),
+			"content", operation,
+		)
 	}
-	if err := allOperationsForSubscription.GetError(); err != nil {
+	if err := operationIter.GetError(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -198,9 +158,6 @@ func dumpKubeApplierData(
 	for _, mc := range managementClusters {
 		mcResourceID := mc.ResourceID
 		if mcResourceID == nil {
-			mcResourceID = mc.CosmosMetadata.ResourceID
-		}
-		if mcResourceID == nil {
 			continue
 		}
 		mcLogger := logger.WithValues("managementCluster", strings.ToLower(mcResourceID.String()))
@@ -225,7 +182,7 @@ func dumpKubeApplierData(
 			mcLogger.Info(fmt.Sprintf("dumping kube-applier resourceID %v", doc.ResourceID),
 				"snapshotType", "cosmos",
 				"currentResourceID", resourceIDToString(doc.ResourceID),
-				"objectMetadata", objectMetadataForTypedDocument("kubeApplier", doc),
+				"objectMetadata", cosmosstorageutils.ObjectMetadataForTypedDocument("kubeApplier", doc),
 				"content", doc,
 			)
 		}
@@ -273,48 +230,9 @@ func DumpBillingToLogger(ctx context.Context, resourcesDBClient corecosmosstorag
 	logger.Info(fmt.Sprintf("dumping billing document for resourceID %v", billingDoc.ResourceID),
 		"snapshotType", "cosmos",
 		"currentResourceID", billingDoc.ResourceID.String(),
-		"objectMetadata", ObjectMetadataForResourceID("billing", billingDoc.ResourceID),
+		"objectMetadata", metadataapi.ObjectMetadataForResourceID("billing", billingDoc.ResourceID),
 		"content", billingDoc,
 	)
 
-	return nil
-}
-
-func redactTypedDocument(d *cosmosstorageutils.TypedDocument) error {
-	if d == nil {
-		return fmt.Errorf("typed document is nil")
-	}
-
-	if len(d.Properties) == 0 {
-		return nil
-	}
-
-	var props unstructured.Unstructured
-	if err := json.Unmarshal(d.Properties, &props.Object); err != nil {
-		return fmt.Errorf("failed to unmarshal typed document properties for %s: %w", resourceIDToString(d.ResourceID), err)
-	}
-
-	if _, found, err := unstructured.NestedString(props.Object, "systemData", "createdBy"); err != nil {
-		return fmt.Errorf("failed to read systemData.createdBy for %s: %w", resourceIDToString(d.ResourceID), err)
-	} else if found {
-		if err := unstructured.SetNestedField(props.Object, RedactStr, "systemData", "createdBy"); err != nil {
-			return fmt.Errorf("failed to set systemData.createdBy for %s: %w", resourceIDToString(d.ResourceID), err)
-		}
-	}
-
-	if _, found, err := unstructured.NestedString(props.Object, "systemData", "lastModifiedBy"); err != nil {
-		return fmt.Errorf("failed to read systemData.lastModifiedBy for %s: %w", resourceIDToString(d.ResourceID), err)
-	} else if found {
-		if err := unstructured.SetNestedField(props.Object, RedactStr, "systemData", "lastModifiedBy"); err != nil {
-			return fmt.Errorf("failed to set systemData.lastModifiedBy for %s: %w", resourceIDToString(d.ResourceID), err)
-		}
-	}
-
-	redactedProps, err := json.Marshal(props.Object)
-	if err != nil {
-		return fmt.Errorf("failed to marshal redacted typed document properties for %s: %w", resourceIDToString(d.ResourceID), err)
-	}
-
-	d.Properties = redactedProps
 	return nil
 }

@@ -57,6 +57,9 @@ type ClusterServiceClientSpec interface {
 	// GetClusterHypershiftDetails sends a GET request to fetch a cluster's hypershift details from Cluster Service.
 	GetClusterHypershiftDetails(ctx context.Context, internalID InternalID) (*cmv1.HypershiftConfig, error)
 
+	// GetClusterResources sends a GET request to fetch cluster resources from Cluster Service.
+	GetClusterResources(ctx context.Context, internalID InternalID) (*arohcpv1alpha1.ClusterResources, error)
+
 	// PostCluster sends a POST request to create a cluster in Cluster Service.
 	PostCluster(ctx context.Context, clusterBuilder *arohcpv1alpha1.ClusterBuilder) (*arohcpv1alpha1.Cluster, error)
 
@@ -370,6 +373,20 @@ func (csc *clusterServiceClient) GetClusterHypershiftDetails(ctx context.Context
 		return nil, fmt.Errorf("empty response body")
 	}
 	return hypershiftConfig, nil
+}
+
+func (csc *clusterServiceClient) GetClusterResources(ctx context.Context,
+	internalID InternalID) (*arohcpv1alpha1.ClusterResources, error) {
+	client, ok := getAroHCPClusterClient(internalID, csc.conn)
+	if !ok {
+		return nil, fmt.Errorf("OCM path is not a cluster: %s", internalID)
+	}
+
+	resp, err := client.Resources().Get().SendContext(ctx)
+	if err != nil {
+		return nil, utils.TrackError(err)
+	}
+	return resp.Body(), nil
 }
 
 func (csc *clusterServiceClient) PostCluster(ctx context.Context, clusterBuilder *arohcpv1alpha1.ClusterBuilder) (*arohcpv1alpha1.Cluster, error) {
@@ -780,7 +797,7 @@ func NewOpenShiftVersionXYZ(v, cg string) string {
 		if len(parts) == 2 {
 			// Patch version is managed by Red Hat. This will be computed automatically to the latest
 			// as part of https://github.com/Azure/ARO-HCP/pull/4477
-			if patch, ok := map[string]string{"4.19": "34", "4.20": "25", "4.21": "20", "4.22": "1"}[v]; ok {
+			if patch, ok := map[string]string{"4.20": "25", "4.21": "20", "4.22": "1"}[v]; ok {
 				parts = append(parts, patch)
 			} else {
 				parts = append(parts, "0")

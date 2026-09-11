@@ -51,6 +51,13 @@ func mustNewInternalID(t *testing.T, path string) *metadataapi.InternalID {
 	return &id
 }
 
+func newManagementClusterWithPolicy(t *testing.T, stampIdentifier string, policy fleetapi.ManagementClusterSchedulingPolicy) *fleetapi.ManagementCluster {
+	t.Helper()
+	managementCluster := newManagementCluster(t, stampIdentifier)
+	managementCluster.Spec.SchedulingPolicy = policy
+	return managementCluster
+}
+
 func newManagementCluster(t *testing.T, stampIdentifier string) *fleetapi.ManagementCluster {
 	t.Helper()
 	managementClusterResourceID, err := fleetapi.ToManagementClusterResourceID(stampIdentifier)
@@ -60,7 +67,6 @@ func newManagementCluster(t *testing.T, stampIdentifier string) *fleetapi.Manage
 			ResourceID:   managementClusterResourceID,
 			PartitionKey: strings.ToLower(stampIdentifier),
 		},
-		ResourceID: managementClusterResourceID,
 		Spec: fleetapi.ManagementClusterSpec{
 			SchedulingPolicy: fleetapi.ManagementClusterSchedulingPolicySchedulable,
 		},

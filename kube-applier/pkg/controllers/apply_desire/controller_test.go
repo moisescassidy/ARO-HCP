@@ -207,6 +207,76 @@ func TestApplyDesired_IssuesSSAPatch(t *testing.T) {
 	if got := patch.GetNamespace(); got != "default" {
 		t.Errorf("patch namespace = %q, want default", got)
 	}
+	if got := ssaFieldManager(t, actions); got != FieldManager {
+		t.Errorf("patch FieldManager = %q, want %q (default)", got, FieldManager)
+	}
+}
+
+// ssaFieldManager returns the FieldManager recorded on the server-side-apply
+// (apply-patch) action captured by the fake dynamic client. The fake routes
+// Apply through Patch with ApplyPatchType and stashes ApplyOptions.FieldManager
+// in the action's PatchOptions, so this is how tests observe which manager the
+// controller selected. Fails the test if no apply-patch action was recorded.
+func ssaFieldManager(t *testing.T, actions []clienttesting.Action) string {
+	t.Helper()
+	for _, a := range actions {
+		pa, ok := a.(clienttesting.PatchActionImpl)
+		if !ok || pa.GetPatchType() != types.ApplyPatchType {
+			continue
+		}
+		return pa.PatchOptions.FieldManager
+	}
+	t.Fatalf("no apply-patch action recorded; actions=%v", actions)
+	return ""
+}
+
+// TestApplyDesired_FieldManagerSelection verifies applyDesired selects the SSA
+// field manager per-desire: the default FieldManager const when the override is
+// unset (nil) or empty, and the override verbatim when set to a non-empty
+// value. The non-empty case supports migrating field ownership cleanly from
+// another manager (e.g. cluster-service).
+func TestApplyDesired_FieldManagerSelection(t *testing.T) {
+	override := "cluster-service"
+	empty := ""
+	cases := []struct {
+		name             string
+		fieldManager     *string
+		wantFieldManager string
+	}{
+		{name: "override unset uses default", fieldManager: nil, wantFieldManager: FieldManager},
+		{name: "override honored when set", fieldManager: &override, wantFieldManager: override},
+		{name: "empty-string override falls back to default", fieldManager: &empty, wantFieldManager: FieldManager},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			gvr := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
+			dyn := fakeDynamic(t, map[schema.GroupVersionResource]string{gvr: "ConfigMapList"})
+			dyn.PrependReactor("patch", "configmaps", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				obj := &unstructured.Unstructured{}
+				obj.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+				obj.SetName(action.(clienttesting.PatchAction).GetName())
+				obj.SetNamespace(action.GetNamespace())
+				return true, obj, nil
+			})
+
+			c := &ApplyDesireController{dyn: dyn}
+			desire := newApplyDesire(t, "ok", configMapTarget("hello"), []byte(`{
+			  "apiVersion": "v1",
+			  "kind": "ConfigMap",
+			  "metadata": {"name":"hello", "namespace":"default"},
+			  "data": {"k":"v"}
+			}`))
+			desire.Spec.ServerSideApply.FieldManager = tc.fieldManager
+
+			if _, err := c.applyDesired(ctx, desire); err != nil {
+				t.Fatalf("applyDesired: %v", err)
+			}
+			if got := ssaFieldManager(t, dyn.Actions()); got != tc.wantFieldManager {
+				t.Errorf("SSA FieldManager = %q, want %q", got, tc.wantFieldManager)
+			}
+		})
+	}
 }
 
 // TestApplyDesired_PreCheckErrors covers every pre-flight failure that must
@@ -393,6 +463,16 @@ func TestSyncOnce_AppliedKubeGenerationSetOnSuccess(t *testing.T) {
 	if got := *replacer.last.Status.AppliedKubeGeneration; got != 3 {
 		t.Errorf("AppliedKubeGeneration = %d, want 3 (metadata.generation from SSA response)", got)
 	}
+	// A ServerSideApply success sets the operation-specific SuccessfullyApplied
+	// condition and mirrors it onto the legacy Successful condition.
+	for _, condType := range []string{kubeapplierapi.ConditionTypeSuccessfullyApplied, kubeapplierapi.ConditionTypeSuccessful} {
+		if got := findCond(replacer.last.Status.Conditions, condType); got == nil || got.Status != metav1.ConditionTrue {
+			t.Errorf("%s=%v, want True after successful apply", condType, got)
+		}
+	}
+	if got := findCond(replacer.last.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted); got != nil {
+		t.Errorf("SuccessfullyDeleted should not be set on a ServerSideApply, got %v", got)
+	}
 }
 
 // TestSyncOnce_AppliedKubeGenerationNilOnFailure verifies that after a failed
@@ -483,6 +563,20 @@ func findCond(conds []metav1.Condition, condType string) *metav1.Condition {
 	return nil
 }
 
+// assertLegacyMirrors verifies the legacy Successful condition mirrors the
+// operation-specific primary condition (same status/reason/message), which the
+// controller dual-writes for backwards compatibility.
+func assertLegacyMirrors(t *testing.T, conds []metav1.Condition, primary *metav1.Condition) {
+	t.Helper()
+	legacy := findCond(conds, kubeapplierapi.ConditionTypeSuccessful)
+	if legacy == nil {
+		t.Fatalf("legacy Successful condition not set (want mirror of %s)", primary.Type)
+	}
+	if legacy.Status != primary.Status || legacy.Reason != primary.Reason || legacy.Message != primary.Message {
+		t.Errorf("legacy Successful=%+v does not mirror %s=%+v", legacy, primary.Type, primary)
+	}
+}
+
 func TestEvaluateDelete_TargetGoneIsSuccessful(t *testing.T) {
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
 		{Version: "v1", Resource: "configmaps"}: "ConfigMapList",
@@ -494,10 +588,11 @@ func TestEvaluateDelete_TargetGoneIsSuccessful(t *testing.T) {
 	})
 	mutate := c.evaluateDelete(context.Background(), desire)
 	mutate(desire)
-	if got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessful); got == nil ||
-		got.Status != metav1.ConditionTrue {
-		t.Errorf("Successful=%v, want True (target absent)", got)
+	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted)
+	if got == nil || got.Status != metav1.ConditionTrue {
+		t.Errorf("SuccessfullyDeleted=%v, want True (target absent)", got)
 	}
+	assertLegacyMirrors(t, desire.Status.Conditions, got)
 }
 
 func TestEvaluateDelete_TargetWithDeletionTimestampWaits(t *testing.T) {
@@ -513,9 +608,9 @@ func TestEvaluateDelete_TargetWithDeletionTimestampWaits(t *testing.T) {
 	})
 	mutate := c.evaluateDelete(context.Background(), desire)
 	mutate(desire)
-	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessful)
+	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted)
 	if got == nil || got.Status != metav1.ConditionFalse {
-		t.Fatalf("Successful=%v, want False (waiting)", got)
+		t.Fatalf("SuccessfullyDeleted=%v, want False (waiting)", got)
 	}
 	if got.Reason != kubeapplierapi.ConditionReasonWaitingForDeletion {
 		t.Errorf("Reason = %q, want %q", got.Reason, kubeapplierapi.ConditionReasonWaitingForDeletion)
@@ -523,6 +618,7 @@ func TestEvaluateDelete_TargetWithDeletionTimestampWaits(t *testing.T) {
 	if !strings.Contains(got.Message, "doomed-uid") {
 		t.Errorf("Message %q does not contain UID", got.Message)
 	}
+	assertLegacyMirrors(t, desire.Status.Conditions, got)
 }
 
 func TestEvaluateDelete_PresentNoTSIssuesDelete_ThenWaitsForFinalizers(t *testing.T) {
@@ -565,10 +661,11 @@ func TestEvaluateDelete_PresentNoTSIssuesDelete_ThenWaitsForFinalizers(t *testin
 	})
 	mutate := c.evaluateDelete(context.Background(), desire)
 	mutate(desire)
-	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessful)
+	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted)
 	if got == nil || got.Status != metav1.ConditionFalse || got.Reason != kubeapplierapi.ConditionReasonWaitingForDeletion {
-		t.Errorf("Successful=%v, want False/WaitingForDeletion", got)
+		t.Errorf("SuccessfullyDeleted=%v, want False/WaitingForDeletion", got)
 	}
+	assertLegacyMirrors(t, desire.Status.Conditions, got)
 }
 
 func TestEvaluateDelete_DeleteAPIErrorClassifiesAsKubeAPIError(t *testing.T) {
@@ -587,10 +684,11 @@ func TestEvaluateDelete_DeleteAPIErrorClassifiesAsKubeAPIError(t *testing.T) {
 	})
 	mutate := c.evaluateDelete(context.Background(), desire)
 	mutate(desire)
-	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessful)
+	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted)
 	if got == nil || got.Status != metav1.ConditionFalse || got.Reason != kubeapplierapi.ConditionReasonKubeAPIError {
-		t.Errorf("Successful=%v, want False/KubeAPIError", got)
+		t.Errorf("SuccessfullyDeleted=%v, want False/KubeAPIError", got)
 	}
+	assertLegacyMirrors(t, desire.Status.Conditions, got)
 }
 
 func TestEvaluateDelete_BadTargetIsPreCheckFailed(t *testing.T) {
@@ -601,8 +699,9 @@ func TestEvaluateDelete_BadTargetIsPreCheckFailed(t *testing.T) {
 	})
 	mutate := c.evaluateDelete(context.Background(), desire)
 	mutate(desire)
-	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessful)
+	got := findCond(desire.Status.Conditions, kubeapplierapi.ConditionTypeSuccessfullyDeleted)
 	if got == nil || got.Reason != kubeapplierapi.ConditionReasonPreCheckFailed {
-		t.Errorf("Successful=%v, want PreCheckFailed", got)
+		t.Errorf("SuccessfullyDeleted=%v, want PreCheckFailed", got)
 	}
+	assertLegacyMirrors(t, desire.Status.Conditions, got)
 }
