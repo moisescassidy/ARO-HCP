@@ -305,3 +305,49 @@ func TestPollUntilReady_StillFailsWhenConditionNeverHolds(t *testing.T) {
 		t.Fatalf("expected the last check error to be wrapped, got: %s", err.Error())
 	}
 }
+
+// TestPollUntilReady_TimedOutFinalCheckKeepsTheLoopsLastError pins the diagnostic this verifier
+// exists to protect: when the post-deadline check merely runs out of its own budget, the reported
+// error must still name the condition the loop kept observing. Replacing it with the bare
+// "context deadline exceeded" that the hung check returned is exactly the uninformative failure
+// string that made ARO-26775 take four months to attribute.
+func TestPollUntilReady_TimedOutFinalCheckKeepsTheLoopsLastError(t *testing.T) {
+	const loopErr = "clusterversion status.history has no version in target minor"
+
+	// A parent deadline shortly after the poll budget keeps the hung final check cheap: finalCtx
+	// inherits it instead of waiting out the full finalCheckTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	// An interval far longer than the budget makes the loop fire exactly once, so the second call
+	// is unambiguously the post-deadline final check. Counting calls rather than reading the clock
+	// keeps this deterministic on a loaded runner.
+	calls := 0
+	err := pollUntilReady(
+		ctx,
+		"test-verifier",
+		100*time.Millisecond,
+		time.Hour,
+		nil,
+		DefaultDiagnoseTimeout,
+		nil,
+		func(ctx context.Context) error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("%s", loopErr)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if calls != 2 {
+		t.Fatalf("expected exactly one loop check and one final check, got %d calls", calls)
+	}
+	if !strings.Contains(err.Error(), loopErr) {
+		t.Errorf("the loop's last observed failure was dropped when the final check timed out, got: %s", err.Error())
+	}
+}

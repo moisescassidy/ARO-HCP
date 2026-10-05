@@ -16,6 +16,7 @@ package verifiers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -53,6 +54,10 @@ func logVerifierTiming(name, outcome string, elapsed time.Duration) {
 // only when the error message changes between polls (delta-only logging). Actual elapsed
 // wall-clock time is logged on both success and failure. If diagnose is set, its output is
 // logged and appended when the poll times out.
+//
+// On timeout the reported error names the condition the polling loop last observed. A
+// post-deadline check that only exhausts its own budget does not displace it, so the failure
+// stays attributable instead of collapsing to "context deadline exceeded".
 //
 // Budget contract, in two parts.
 //
@@ -124,6 +129,8 @@ func pollUntilReady(
 	// budget, missed because the preceding poll had fired 2m earlier.
 	finalCtx, cancelFinal := context.WithTimeout(ctx, finalCheckTimeout)
 	finalErr := check(finalCtx)
+	// Read before cancelFinal(), which would make Err() non-nil regardless of why the check ended.
+	finalCheckTimedOut := errors.Is(finalCtx.Err(), context.DeadlineExceeded)
 	cancelFinal()
 
 	// Recompute rather than reusing the pre-check value: the final check runs after the deadline,
@@ -134,7 +141,15 @@ func pollUntilReady(
 		logVerifierTiming(name, "succeeded on the final check after the deadline", elapsed)
 		return nil
 	}
-	lastErr = finalErr
+	// Only let the final check replace what the loop observed if it actually reached a verdict.
+	// When it merely ran out of finalCheckTimeout, finalErr is a bare "context deadline exceeded",
+	// which is strictly less actionable than the condition the loop kept reporting -- and losing
+	// that condition is the failure mode this verifier exists to prevent. The discriminator is
+	// finalCtx's own deadline rather than errors.Is(finalErr, context.DeadlineExceeded), so a
+	// genuine deadline error returned by the cluster itself is still preserved.
+	if !finalCheckTimedOut || lastErr == nil {
+		lastErr = finalErr
+	}
 
 	logVerifierTiming(name, "timed out", elapsed)
 	if diagnose != nil {
