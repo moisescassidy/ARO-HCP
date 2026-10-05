@@ -214,7 +214,7 @@ var _ = Describe("Customer", func() {
 			}).WithContext(ctx).WithTimeout(2*time.Minute).WithPolling(framework.StandardPollInterval).Should(Succeed(), "probe pod CREATE was not denied by ValidatingAdmissionPolicy on cluster %q", clusterName)
 
 			Expect(ctx.Err()).NotTo(HaveOccurred(), "test context expired before triggering upgrade for cluster %q", clusterName)
-			preUpgradeKubeAPIServerVersion, err := kubeClient.Discovery().ServerVersion()
+			preUpgradeKubeAPIServerVersion, err := framework.GetKubeAPIServerVersion(ctx, kubeClient.Discovery())
 			Expect(err).NotTo(HaveOccurred(), "failed to get pre-upgrade kube-apiserver version for cluster %q", clusterName)
 
 			By(fmt.Sprintf("triggering control plane y-stream upgrade to %s (target minor %s)", upgradeVersionId,
