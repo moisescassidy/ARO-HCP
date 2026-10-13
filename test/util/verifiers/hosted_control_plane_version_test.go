@@ -20,6 +20,8 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 
 	configv1 "github.com/openshift/api/config/v1"
 )
@@ -52,7 +54,7 @@ func TestRenderClusterVersionHistory(t *testing.T) {
 			history: []configv1.UpdateHistory{
 				{Version: "4.21.13", State: configv1.PartialUpdate, StartedTime: completed},
 			},
-			expected: "4.21.13=Partial started=01:24:16",
+			expected: "4.21.13=Partial started=2026-05-06T01:24:16Z",
 		},
 		{
 			// The history ARO-26775 had to be recovered from Kusto, because the test output
@@ -68,8 +70,8 @@ func TestRenderClusterVersionHistory(t *testing.T) {
 					Image: "arohcpocpint.azurecr.io/openshift-release-dev/ocp-release@sha256:1a59c7136e704fb5e0b4824b55757dac29b04c606ee2d05757a142cb90504b5d",
 				},
 			},
-			expected: "4.21.13=Partial started=01:24:16 image=sha256:9d0436ae6f21; " +
-				"4.20.20=Completed started=00:36:22 completed=01:24:16 image=sha256:1a59c7136e70",
+			expected: "4.21.13=Partial started=2026-05-06T01:24:16Z image=sha256:9d0436ae6f21; " +
+				"4.20.20=Completed started=2026-05-06T00:36:22Z completed=2026-05-06T01:24:16Z image=sha256:1a59c7136e70",
 		},
 		{
 			name: "entry with no timestamps or image renders version and state only",
@@ -77,6 +79,35 @@ func TestRenderClusterVersionHistory(t *testing.T) {
 				{Version: "4.20.20", State: configv1.CompletedUpdate},
 			},
 			expected: "4.20.20=Completed",
+		},
+		{
+			// A time-only rendering of this entry reads as completing 1h35m before it started.
+			// status.history spans install through upgrade, and e2e-parallel runs at all hours,
+			// so any sufficiently long-running spec eventually straddles midnight.
+			name: "an entry spanning UTC midnight still reads in order",
+			history: []configv1.UpdateHistory{
+				{
+					Version:        "4.20.20",
+					State:          configv1.CompletedUpdate,
+					StartedTime:    mustTime(t, "2026-05-05T23:55:00Z"),
+					CompletionTime: ptr.To(mustTime(t, "2026-05-06T00:20:00Z")),
+				},
+			},
+			expected: "4.20.20=Completed started=2026-05-05T23:55:00Z completed=2026-05-06T00:20:00Z",
+		},
+		{
+			// clusterversion stamps are UTC on the wire, but the renderer must not emit a local
+			// offset if it is ever handed a non-UTC Time: RFC3339 renders one, and a mix of
+			// offsets in a single line cannot be compared by eye.
+			name: "a non-UTC stamp is normalised to UTC",
+			history: []configv1.UpdateHistory{
+				{
+					Version:     "4.20.20",
+					State:       configv1.CompletedUpdate,
+					StartedTime: metav1.NewTime(started.In(time.FixedZone("UTC+5", 5*60*60))),
+				},
+			},
+			expected: "4.20.20=Completed started=2026-05-06T00:36:22Z",
 		},
 		{
 			// Two entries can share a version and differ only by payload, which is why the
@@ -227,5 +258,53 @@ func TestClusterVersionSummaryWithoutProgress(t *testing.T) {
 	}
 	if summary != "history is 4.20.20=Completed" {
 		t.Errorf("unexpected summary: %q", summary)
+	}
+}
+
+// TestYStreamVerifierRejectsUnparseableMinors pins that a bad minor string is reported as a named
+// error rather than a panic.
+//
+// This verifier is called from a retry loop, so a panic unwinds the loop and leaves a stack trace
+// where the offending string should be -- the opposite of what a verifier whose whole purpose is
+// diagnostic output should produce. Parsing happens before the clusterversion GET, so an empty
+// rest.Config is enough to reach the check: if the parse ever moves back below the GET, these
+// cases start failing on a connection error instead and the regression is visible.
+func TestYStreamVerifierRejectsUnparseableMinors(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		previousMinor string
+		targetMinor   string
+		expected      string
+	}{
+		{
+			name:          "unparseable previous minor",
+			previousMinor: "not-a-version",
+			targetMinor:   "4.21",
+			expected:      `parse previous minor "not-a-version"`,
+		},
+		{
+			name:          "unparseable target minor",
+			previousMinor: "4.20",
+			targetMinor:   "also-not-a-version",
+			expected:      `parse target minor "also-not-a-version"`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("Verify panicked instead of returning an error: %v", recovered)
+				}
+			}()
+
+			err := VerifyHostedControlPlaneYStreamUpgrade(testCase.previousMinor, testCase.targetMinor).
+				Verify(t.Context(), &rest.Config{})
+			if err == nil {
+				t.Fatalf("expected an error for previousMinor=%q targetMinor=%q, got none",
+					testCase.previousMinor, testCase.targetMinor)
+			}
+			if !strings.Contains(err.Error(), testCase.expected) {
+				t.Errorf("error\n  got:  %s\n  want it to contain: %s", err, testCase.expected)
+			}
+		})
 	}
 }

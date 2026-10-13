@@ -32,8 +32,6 @@ import (
 
 	configv1 "github.com/openshift/api/config/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
-
-	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 )
 
 // shortImageDigest reduces a release image reference to the leading 12 characters of its digest,
@@ -50,7 +48,14 @@ func shortImageDigest(image string) string {
 }
 
 // renderClusterVersionHistory renders status.history as one compact line, e.g.
-// `4.21.13=Partial started=01:24:16 image=sha256:9d0436ae6f21`.
+// `4.21.13=Partial started=2026-05-06T01:24:16Z image=sha256:9d0436ae6f21`.
+//
+// The stamps carry their date. status.history spans cluster install through upgrade completion,
+// so a time-only rendering inverts any entry that straddles UTC midnight --
+// `started=23:55:00 completed=00:20:00` reads as finishing before it started. e2e-parallel runs
+// at all hours, and the install stamps in ARO-26775 itself landed at 00:36 and 01:24, within an
+// hour of tripping it. RFC3339 is also the form the Kusto queries used to attribute that ticket
+// accept, so a stamp can be pasted from a Prow log straight into a query.
 func renderClusterVersionHistory(history []configv1.UpdateHistory) string {
 	if len(history) == 0 {
 		return "<empty>"
@@ -59,10 +64,10 @@ func renderClusterVersionHistory(history []configv1.UpdateHistory) string {
 	for _, historyEntry := range history {
 		entry := fmt.Sprintf("%s=%s", historyEntry.Version, historyEntry.State)
 		if !historyEntry.StartedTime.IsZero() {
-			entry += " started=" + historyEntry.StartedTime.UTC().Format(time.TimeOnly)
+			entry += " started=" + historyEntry.StartedTime.UTC().Format(time.RFC3339)
 		}
 		if historyEntry.CompletionTime != nil && !historyEntry.CompletionTime.IsZero() {
-			entry += " completed=" + historyEntry.CompletionTime.UTC().Format(time.TimeOnly)
+			entry += " completed=" + historyEntry.CompletionTime.UTC().Format(time.RFC3339)
 		}
 		if image := shortImageDigest(historyEntry.Image); image != "" {
 			entry += " image=" + image
@@ -206,6 +211,20 @@ func (v verifyHostedControlPlaneYStreamUpgrade) Name() string {
 }
 
 func (v verifyHostedControlPlaneYStreamUpgrade) Verify(ctx context.Context, adminRESTConfig *rest.Config) error {
+	// Parse the caller's input first, and as errors rather than panics. Neither value can become
+	// valid by waiting, so a Must here panics out of the retry loop this verifier is called from
+	// and reports a stack trace instead of naming the offending string -- the opposite of what a
+	// diagnostic verifier should leave behind. Checking before the GET also fails a typo
+	// immediately rather than after a round trip.
+	parsedPreviousMinor, err := semver.ParseTolerant(v.previousMinor)
+	if err != nil {
+		return fmt.Errorf("parse previous minor %q: %w", v.previousMinor, err)
+	}
+	parsedTargetMinor, err := semver.ParseTolerant(v.targetMinor)
+	if err != nil {
+		return fmt.Errorf("parse target minor %q: %w", v.targetMinor, err)
+	}
+
 	configClient, err := configv1client.NewForConfig(adminRESTConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create config client: %w", err)
@@ -217,9 +236,6 @@ func (v verifyHostedControlPlaneYStreamUpgrade) Verify(ctx context.Context, admi
 	}
 
 	v.phaseLog.observe("clusterversion status after y-stream upgrade", clusterVersionSummary(clusterVersion.Status))
-
-	parsedPreviousMinor := metadataapi.Must(semver.ParseTolerant(v.previousMinor))
-	parsedTargetMinor := metadataapi.Must(semver.ParseTolerant(v.targetMinor))
 
 	var previousMinorFound, targetMinorFound bool
 	for _, historyEntry := range clusterVersion.Status.History {
